@@ -75,7 +75,6 @@ def build_chart(chart):
 def render_chart(chart):
     try:
         result=build_chart(chart)
-        result.to_dict(validate=True)
         st.subheader(chart['title'])
         st.altair_chart(result,use_container_width=True)
     except Exception:
