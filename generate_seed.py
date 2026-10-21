@@ -137,7 +137,7 @@ def create_scenario_order(conn, oid, customer, lines, as_of, placed=False):
             require(updated.rowcount==1,'Bulk order has insufficient inventory.')
     update_totals(conn,oid,totals(conn,subtotal))
     if placed:
-        conn.execute('UPDATE orders SET order_invoice=? WHERE order_id=?',('INV-'+oid,oid))
+        conn.execute("UPDATE orders SET order_invoice=?,order_status='placed' WHERE order_id=?",('INV-'+oid,oid))
 
 
 def enrich(conn, as_of):
@@ -160,7 +160,7 @@ def enrich(conn, as_of):
             raise ValueError('Not enough stock for a valid bulk invoice. Use a fresh --db path.')
     currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
     for order in conn.execute(f"SELECT * FROM orders WHERE order_id GLOB '{prefix}-*' ORDER BY order_id").fetchall():
-        placed = bool(order['order_invoice'])
+        placed = order['order_status'] == 'placed'
         contact = dict(conn.execute('SELECT * FROM customers WHERE customer_id=?',(order['customer_id'],)).fetchone())
         conn.execute('''INSERT OR IGNORE INTO order_details(order_id,currency,due_date,customer_snapshot)
             VALUES (?,?,?,?)''',(order['order_id'],currency,
@@ -182,7 +182,7 @@ def audit_enrichment(conn):
         oid = order['order_id']
         require(money(order['subtotal'])-money(order['discount_applied'])+money(order['tax_amount'])+money(order['shipping_amount'])
                 == money(order['charged_price']),f'{oid} total mismatch.')
-        if order['order_invoice']:
+        if order['order_status'] in ('placed', 'cancelled') and order['order_invoice']:
             requested = dict(conn.execute('SELECT item_code,quantity FROM order_requests WHERE order_id=?',(oid,)))
             fulfilled = dict(conn.execute('SELECT item_code,quantity FROM order_fulfilled WHERE order_id=?',(oid,)))
             lines = conn.execute('SELECT * FROM invoice_lines WHERE order_id=?',(oid,)).fetchall()
@@ -230,7 +230,7 @@ def audit(conn, opening_stock):
         invoice = conn.execute("SELECT * FROM invoice_lines WHERE order_id=?", (oid,)).fetchall()
         require(bool(requested), f"{oid} has no requested items.")
         subtotal = Decimal(0)
-        if order["order_invoice"]:
+        if order['order_status'] in ('placed', 'cancelled') and order["order_invoice"]:
             require(requested == fulfilled, f"{oid} request and fulfillment mismatch.")
             require({r["item_code"]: r["qty_billed"] for r in invoice} == requested,
                     f"{oid} billed quantities do not match fulfillment.")
@@ -334,9 +334,10 @@ def generate_records(db_path: Path, seed: int, as_of: date):
         schema = '\n'.join((settings.ROOT / 'database' / name).read_text(encoding='utf-8')
                            for name in ('schema.sql','operations.sql','insights.sql','service.sql'))
         conn.executescript("BEGIN IMMEDIATE;\n" + schema)
-        from database.migrations import add_promotion_expiry, add_unknown_fulfillment
+        from database.migrations import add_promotion_expiry, add_unknown_fulfillment, add_order_status
         add_promotion_expiry(conn)
         add_unknown_fulfillment(conn)
+        add_order_status(conn)
         prefix, shopping, marker, enrichment_marker = seed_layout(conn)
         if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (enrichment_marker,)).fetchone():
             from database.service_seed import seed_service_scenarios
@@ -432,7 +433,7 @@ def generate_records(db_path: Path, seed: int, as_of: date):
             values = totals(conn, subtotal, promo, check_expiry=False)
             update_totals(conn, oid, values)
             if placed:
-                conn.execute("UPDATE orders SET order_invoice=? WHERE order_id=?", (f"INV-{prefix}-{as_of.year}-{i:04d}", oid))
+                conn.execute("UPDATE orders SET order_invoice=?,order_status='placed' WHERE order_id=?", (f"INV-{prefix}-{as_of.year}-{i:04d}", oid))
             total = money(values["charged_price"])
             if i in refunded and total > 0:
                 kind = refunded[i]
