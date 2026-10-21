@@ -3,6 +3,8 @@ import math
 import re
 import sqlite3
 import time
+from collections import OrderedDict
+from threading import RLock
 from config import settings
 from database.connection import connect
 
@@ -16,6 +18,17 @@ FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnu
                 'round rtrim strftime substr substring sum time total trim typeof '
                 'unicode upper row_number rank dense_rank lag lead first_value last_value '
                 'json_extract json_type json_valid json_array_length current_date current_time current_timestamp'.split())
+
+# Store schema text only. Each lookup still checks the current database file and
+# SQLite schema version; prices, customers and other business rows are never cached.
+_SCHEMA_CACHE_LIMIT = 12
+_schema_cache = OrderedDict()
+_schema_cache_lock = RLock()
+
+
+def _database_identity(path):
+    stat = path.stat()
+    return (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns)
 
 
 def quote_reserved_aliases(query):
@@ -40,9 +53,23 @@ def quote_reserved_aliases(query):
 
 
 def schema_hint(mode='customer'):
-    """Read metadata only, scoped like the query tool; no business rows or cache."""
+    """Return current, role-scoped schema metadata without reading business rows."""
+    path = settings.BILLING_DB.resolve()
+    identity = _database_identity(path)
     conn = connect(readonly=True)
     try:
+        # Read the version and columns from one snapshot if another process runs
+        # a migration. Replacements at the same path get a different file key.
+        conn.execute('BEGIN')
+        version = conn.execute('PRAGMA schema_version').fetchone()[0]
+        key = (identity, version, mode, tuple(sorted(TABLES)))
+        unchanged = identity == _database_identity(path)
+        if unchanged:
+            with _schema_cache_lock:
+                cached = _schema_cache.get(key)
+                if cached is not None:
+                    _schema_cache.move_to_end(key)
+                    return cached
         tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
         columns = {}
         for table in tables:
@@ -61,7 +88,14 @@ def schema_hint(mode='customer'):
                     joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
         lines.append('Declared join keys: ' + '; '.join(joins))
         lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
-        return '\n'.join(lines)
+        hint = '\n'.join(lines)
+        if unchanged and identity == _database_identity(path):
+            with _schema_cache_lock:
+                _schema_cache[key] = hint
+                _schema_cache.move_to_end(key)
+                while len(_schema_cache) > _SCHEMA_CACHE_LIMIT:
+                    _schema_cache.popitem(last=False)
+        return hint
     finally:
         conn.close()
 
