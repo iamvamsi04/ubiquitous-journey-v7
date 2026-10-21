@@ -1,7 +1,9 @@
 """Customer shopping comparisons; deterministic prices, no invented specifications."""
 import json
 import re
+import unicodedata
 from decimal import Decimal
+from database.product_search import product_text, register_product_search
 from mcp_server.tools.billing_tools import BillingError, tool_result, money, price_for
 from mcp_server.tools.operations_tools import reading
 
@@ -23,35 +25,57 @@ def resolve(conn, reference):
     if not isinstance(reference, str) or not reference.strip() or len(reference) > 200:
         raise BillingError('Provide an item code, SKU or product name.')
     reference = reference.strip()
+    register_product_search(conn)
     rows = conn.execute('SELECT * FROM items WHERE item_code=? OR sku=?', (reference, reference)).fetchall()
     if not rows:
-        rows = conn.execute('SELECT * FROM items WHERE lower(name)=lower(?)', (reference,)).fetchall()
+        rows = conn.execute('SELECT * FROM items WHERE product_text(name)=product_text(?)', (reference,)).fetchall()
     if not rows:
-        rows = conn.execute('SELECT * FROM items WHERE instr(lower(name),lower(?))>0 LIMIT 6', (reference,)).fetchall()
+        rows = conn.execute('SELECT * FROM items WHERE product_matches(name,?) LIMIT 6', (reference,)).fetchall()
     if len(rows) != 1:
         choices = ', '.join(f"{r['item_code']} ({r['name']})" for r in rows[:5])
         raise BillingError('Product not found.' if not rows else 'Product is ambiguous. Ask the customer to choose: ' + choices)
     return rows[0]
 
 
+def feature_key(value):
+    return ' '.join(re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', value).casefold()))
+
+
+def same_feature_value(left, right):
+    if type(left) in (int, float) and type(right) in (int, float):
+        return Decimal(str(left)) == Decimal(str(right))
+    if isinstance(left, str) and isinstance(right, str):
+        return left.casefold() == right.casefold()
+    return type(left) is type(right) and left == right
+
+
 def product(conn, row, today, quantity, budget, requirements):
     detail = conn.execute('SELECT * FROM product_details WHERE item_code=?', (row['item_code'],)).fetchone()
     features = json.loads(detail['features_json']) if detail else {}
     units = {}
-    for attribute in conn.execute('SELECT * FROM product_attributes WHERE item_code=?', (row['item_code'],)):
+    attributes = conn.execute('SELECT * FROM product_attributes WHERE item_code=?', (row['item_code'],)).fetchall()
+    typed_keys = {feature_key(attribute['attribute']) for attribute in attributes}
+    # Typed records override legacy JSON, but never overwrite a conflicting typed
+    # record simply because its spelling uses a different separator.
+    features = {key: value for key, value in features.items() if feature_key(key) not in typed_keys}
+    for attribute in attributes:
         key = attribute['attribute']
-        # Explicit typed attributes take precedence over a legacy JSON key (case-insensitively).
-        for existing in list(features):
-            if existing.casefold() == key.casefold():
-                del features[existing]
         features[key] = attribute['text_value'] if attribute['text_value'] is not None else attribute['number_value']
         if attribute['unit']:
             units[key] = attribute['unit']
+    keys = {}
+    for key in features:
+        keys.setdefault(feature_key(key), []).append(key)
+    ambiguous = {name for name, matches in keys.items() if any(
+        not same_feature_value(features[matches[0]], features[key]) or units.get(matches[0]) != units.get(key)
+        for key in matches[1:])}
     unit = price_for(conn, row, today)
     total = money(unit * quantity)
     matched, missing, different = [], [], []
     for key, value in requirements.items():
-        recorded_key = next((k for k in features if k.casefold()==key.casefold()),None)
+        normalized = feature_key(key)
+        recorded_keys = keys.get(normalized, [])
+        recorded_key = recorded_keys[0] if recorded_keys and normalized not in ambiguous else None
         if recorded_key is None:
             missing.append(key)
         elif (str(features[recorded_key]).casefold() == str(value).casefold() or
@@ -66,7 +90,8 @@ def product(conn, row, today, quantity, budget, requirements):
             'unit_price': str(unit), 'quantity': quantity, 'merchandise_total': str(total),
             'available_quantity': row['availablequantity'], 'enough_stock': row['availablequantity'] >= quantity,
             'within_budget': budget is None or total <= budget,
-            'matched_features': matched, 'unknown_features': missing, 'different_features': different}
+            'matched_features': matched, 'unknown_features': missing, 'different_features': different,
+            'ambiguous_features': [key for name, matches in keys.items() if name in ambiguous for key in matches]}
 
 
 def context(conn):
@@ -80,6 +105,7 @@ def eligible(row):
 
 NOTES = ['Prices use today\'s dated price history, falling back to sellingprice, as in order quoting.',
          'Budget covers merchandise for the requested quantity, before promotions, tax and shipping. Request an order draft for the final total.',
+         'Conflicting equivalent feature keys remain unknown; verify their recorded values and units before recommending.',
          'Missing features are unknown. Price and stock do not establish quality, compatibility or suitability. No inventory is reserved.']
 
 
@@ -88,8 +114,9 @@ def compare_products(products: list[str], quantity: int = 1, budget: str | None 
                      required_features: dict | None = None) -> dict:
     """Compare 2-5 products by code/SKU/name, price, stock and recorded features.
 
-    budget is the TOTAL merchandise budget for quantity. required_features maps exact stored feature
-    names to desired values (e.g. {"connection":"wireless"}); missing features stay unknown.
+    budget is the TOTAL merchandise budget for quantity. required_features maps recorded feature
+    names to desired values (e.g. {"connection":"wireless"}); key case/separators are ignored,
+    values and units are preserved, and missing or conflicting features stay unknown.
     Suggests the lowest-priced available match, never an unsupported overall quality winner.
     Ask what 'better' means for the customer. Product names can be ambiguous; ask instead of guessing.
     """
@@ -104,7 +131,7 @@ def compare_products(products: list[str], quantity: int = 1, budget: str | None 
         matches = [r for r in rows if eligible(r)]
         lowest = min((Decimal(r['unit_price']) for r in matches), default=None)
         winners = [r['item_code'] for r in matches if Decimal(r['unit_price']) == lowest]
-        categories = {r['category'] for r in rows}
+        categories = {product_text(r['category']) for r in rows}
         return {'currency': currency, 'as_of': today, 'products': rows,
                 'lowest_price_matching_items': winners,
                 'recommendation_basis': 'Lowest current price among in-stock products meeting budget and every recorded requirement; ties retained.',
@@ -113,7 +140,7 @@ def compare_products(products: list[str], quantity: int = 1, budget: str | None 
 
 
 def words(name):
-    return set(re.findall(r'[a-z]+', name.lower())) - {
+    return {word for word in product_text(name).split() if word.isalpha()} - {
         'a', 'an', 'the', 'for', 'with', 'and', 'inch', 'cm', 'gb', 'tb', 'hd',
         'black', 'white', 'red', 'blue', 'premium', 'basic', 'pro', 'model', 'variant', 'wireless', 'usb'}
 
@@ -124,8 +151,9 @@ def find_cheaper_alternatives(product_reference: str, quantity: int = 1, budget:
     """Find cheaper in-stock alternatives within the same recorded category.
 
     Without a source category, uses shared meaningful name words and labels matches tentative.
-    Never treats a cheaper unrelated item as equivalent. Exact required features must be recorded
-    and match. Budget is total merchandise cost for quantity, before tax/shipping/promotions.
+    Never treats a cheaper unrelated item as equivalent. Required features must be recorded and
+    match; key case/separators are ignored, while values and units are preserved. Budget is total
+    merchandise cost for quantity, before tax/shipping/promotions.
     """
     budget, requirements = options(quantity, budget, required_features)
     if type(limit) is not int or not 1 <= limit <= 10:
@@ -135,7 +163,7 @@ def find_cheaper_alternatives(product_reference: str, quantity: int = 1, budget:
         source = product(conn, resolve(conn, product_reference), today, quantity, budget, requirements)
         if source['category']:
             candidates = conn.execute('SELECT i.* FROM items i JOIN product_details d ON d.item_code=i.item_code '
-                'WHERE lower(d.category)=lower(?) AND i.item_code<>? AND i.availablequantity>=?',
+                'WHERE product_text(d.category)=product_text(?) AND i.item_code<>? AND i.availablequantity>=?',
                 (source['category'], source['item_code'], quantity)).fetchall()
         else:
             candidates = conn.execute('SELECT * FROM items WHERE item_code<>? AND availablequantity>=?',
