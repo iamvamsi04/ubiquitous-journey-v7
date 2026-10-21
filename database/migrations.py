@@ -105,3 +105,59 @@ def add_unknown_fulfillment(conn):
         conn.execute('ROLLBACK TO service_upgrade')
         conn.execute('RELEASE service_upgrade')
         raise
+
+
+def add_order_status(conn):
+    """Keep one explicit order lifecycle, preserving invoices and cancellations.
+
+    Invoice triggers also support existing imports that supply an invoice without
+    a status. An empty invoice is never evidence of a placed order.
+    """
+    conn.execute('SAVEPOINT order_status_upgrade')
+    try:
+        if 'order_status' not in {row[1] for row in conn.execute('PRAGMA table_info(orders)')}:
+            conn.execute("ALTER TABLE orders ADD COLUMN order_status TEXT NOT NULL DEFAULT 'draft' "
+                         "CHECK(order_status IN ('draft','placed','cancelled'))")
+        nonempty = "length(trim(COALESCE(order_invoice,''),char(9)||char(10)||char(13)||' '))>0"
+        conn.execute("UPDATE orders SET order_invoice=NULL WHERE order_invoice IS NOT NULL AND NOT (" + nonempty + ")")
+        state = ("CASE WHEN order_status='cancelled' "
+                 "OR EXISTS(SELECT 1 FROM order_details d WHERE d.order_id=orders.order_id AND d.status='cancelled') "
+                 "OR EXISTS(SELECT 1 FROM order_service s WHERE s.order_id=orders.order_id AND s.fulfillment_status='cancelled') "
+                 "THEN 'cancelled' WHEN " + nonempty + " THEN 'placed' ELSE 'draft' END")
+        conn.execute("UPDATE orders SET order_status=" + state + " WHERE order_status!=(" + state + ")")
+        conn.execute('CREATE INDEX IF NOT EXISTS ix_orders_status_customer ON orders(order_status,customer_id,order_date)')
+        invoice_new = "length(trim(COALESCE(NEW.order_invoice,''),char(9)||char(10)||char(13)||' '))>0"
+        invoice_old = "length(trim(COALESCE(OLD.order_invoice,''),char(9)||char(10)||char(13)||' '))>0"
+        triggers = [
+            "CREATE TRIGGER IF NOT EXISTS order_status_insert_guard BEFORE INSERT ON orders "
+            "WHEN NEW.order_status='placed' AND NOT (" + invoice_new + ") "
+            "BEGIN SELECT RAISE(ABORT,'Placed order requires an issued invoice'); END",
+            "CREATE TRIGGER IF NOT EXISTS order_status_update_guard BEFORE UPDATE OF order_status ON orders "
+            "WHEN (OLD.order_status='cancelled' AND NEW.order_status!='cancelled') "
+            "OR (OLD.order_status='placed' AND NEW.order_status='draft') "
+            "OR (NEW.order_status='placed' AND NOT (" + invoice_new + ")) "
+            "BEGIN SELECT RAISE(ABORT,'Invalid order lifecycle transition'); END",
+            "CREATE TRIGGER IF NOT EXISTS order_invoice_identity_guard BEFORE UPDATE OF order_invoice ON orders "
+            "WHEN (OLD.order_status='cancelled' OR (OLD.order_status='placed' AND (" + invoice_old + "))) "
+            "AND NEW.order_invoice IS NOT OLD.order_invoice "
+            "BEGIN SELECT RAISE(ABORT,'Issued invoice identity cannot change'); END",
+            "CREATE TRIGGER IF NOT EXISTS order_invoice_insert_state AFTER INSERT ON orders "
+            "WHEN NEW.order_status='draft' AND (" + invoice_new + ") "
+            "BEGIN UPDATE orders SET order_status='placed' WHERE order_id=NEW.order_id; END",
+            "CREATE TRIGGER IF NOT EXISTS order_invoice_update_state AFTER UPDATE OF order_invoice ON orders "
+            "WHEN NEW.order_status='draft' AND (" + invoice_new + ") "
+            "BEGIN UPDATE orders SET order_status='placed' WHERE order_id=NEW.order_id; END",
+        ]
+        for table, column in (('order_details', 'status'), ('order_service', 'fulfillment_status')):
+            for event in ('INSERT', 'UPDATE OF ' + column):
+                suffix = 'insert' if event == 'INSERT' else 'update'
+                triggers.append(f'CREATE TRIGGER IF NOT EXISTS {table}_cancel_{suffix} AFTER {event} ON {table} '
+                                f"WHEN NEW.{column}='cancelled' BEGIN UPDATE orders SET order_status='cancelled' "
+                                'WHERE order_id=NEW.order_id; END')
+        for statement in triggers:
+            conn.execute(statement)
+        conn.execute('RELEASE order_status_upgrade')
+    except BaseException:
+        conn.execute('ROLLBACK TO order_status_upgrade')
+        conn.execute('RELEASE order_status_upgrade')
+        raise
