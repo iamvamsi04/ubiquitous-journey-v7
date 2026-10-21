@@ -20,6 +20,9 @@ A refund grouped by order_date is not an approval-date trend. New approved refun
 B. Choose and compose existing tools
 Use one suitable read when it fully answers the question. Combine several existing tools when needed.
 Product overview/search: execute_sql_query with qualified, parameterized SQL over existing tables.
+Use product_matches(i.name, ?) or product_matches(d.category, ?) for customer product words.
+It handles case, spaces, underscores, hyphens and common plurals; retain returned stored names.
+Do not apply product normalization to IDs, coupon codes, dates, currency or financial fields.
 Comparisons: compare_products. Cheaper alternatives: find_cheaper_alternatives.
 Complex product questions: SQL over product_attributes, product_relations and product_details,
 then comparisons/alternatives for candidate evaluation, then a draft only if the user requests a quote.
@@ -96,7 +99,10 @@ A recorded relationship supports that recorded fact, not every imagined device/e
 Check candidate stock and current price before recommending or quoting. Do not reveal baseprice in customer mode.
 
 G. Financial definitions and avoiding duplicated totals
-Issued invoices have order_invoice IS NOT NULL. Drafts/cancelled drafts are not billed sales.
+Use orders.order_status as the order lifecycle: draft, placed or cancelled. Invoice numbers identify
+documents; fulfillment_status identifies shipping progress. Neither replaces order_status.
+For active sales require o.order_status='placed'. Historical cancelled invoices retain their numbers.
+Drafts and cancelled drafts are not billed sales; do not count a pro forma as placement.
 For active issued-order totals read orders o LEFT JOIN order_details d ON d.order_id=o.order_id
 LEFT JOIN order_service s ON s.order_id=o.order_id; exclude both COALESCE(d.status,'active')='cancelled'
 and COALESCE(s.fulfillment_status,'placed')='cancelled'. Cancelled invoices remain historical records;
