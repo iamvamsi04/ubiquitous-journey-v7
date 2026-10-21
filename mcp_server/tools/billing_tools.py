@@ -42,20 +42,24 @@ def identifier(value, label):
     return value
 
 
-def order_row(conn, order_id, customer_id):
+def order_row(conn, order_id, customer_id, *, allow_cancelled=False):
     row = conn.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=?",
                        (order_id, customer_id)).fetchone()
     if row is None:
         raise BillingError("Order not found for this customer.")
-    meta = conn.execute("SELECT status FROM order_details WHERE order_id=?", (order_id,)).fetchone()
-    if meta and meta['status'] == 'cancelled':
-        raise BillingError("This draft was cancelled. Create a new order.")
+    if row['order_status'] == 'cancelled' and not allow_cancelled:
+        raise BillingError("This order was cancelled. Create a new draft; cancelled orders cannot be reopened.")
+    if row['order_status'] == 'draft':
+        if row['refund_amount'] is not None or row['refund_status']:
+            raise BillingError('Draft has inconsistent refund records. Staff must correct its records before changes.')
+        if conn.execute("SELECT 1 FROM order_fulfilled WHERE order_id=? UNION ALL "
+                        "SELECT 1 FROM invoice_lines WHERE order_id=? LIMIT 1", (order_id, order_id)).fetchone():
+            raise BillingError('Draft has unissued fulfillment or invoice records. Staff must correct its records before changes.')
     return row
 
 
 def is_placed(conn, order):
-    return bool(order["order_invoice"] or conn.execute(
-        "SELECT 1 FROM order_fulfilled WHERE order_id=?", (order["order_id"],)).fetchone())
+    return order['order_status'] in ('placed', 'cancelled') and bool((order['order_invoice'] or '').strip())
 
 
 def lines_for(conn, order_id):
@@ -143,7 +147,8 @@ def request_order(customer_id: str, items: list[dict], order_id: str | None = No
             previous = dict(conn.execute("SELECT item_code,quantity FROM order_requests WHERE order_id=?", (order_id,)))
             if existing["customer_id"] != customer_id or previous != quantities:
                 raise BillingError("Order ID already exists with different request data.")
-            return {"order_id": order_id, "already_exists": True, "status": "placed" if is_placed(conn, existing) else "requested"}
+            return {"order_id": order_id, "already_exists": True, "status": existing['order_status'],
+                    'order_status': existing['order_status']}
         date = conn.execute("SELECT CURRENT_DATE").fetchone()[0]
         subtotal = Decimal(0)
         for code, qty in quantities.items():
@@ -162,19 +167,48 @@ def request_order(customer_id: str, items: list[dict], order_id: str | None = No
         currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()
         conn.execute('INSERT INTO order_details(order_id,currency) VALUES (?,?)',
                      (order_id, currency[0] if currency else 'USD'))
-    return {"order_id": order_id, "status": "requested", "estimate": values,
+    return {"order_id": order_id, "status": "draft", "order_status": "draft", "estimate": values,
             "currency": currency[0] if currency else 'USD',
             "note": "Inventory is not reserved. Placement recalculates totals using order-date prices."}
 
 
 @tool_result
-def apply_promotion(order_id: str, customer_id: str, promo_code: str) -> dict:
-    """Apply one unexpired coupon per draft. A different second code is rejected; same-code repeats do not stack."""
+def apply_promotion(order_id: str | None, customer_id: str, promo_code: str, action: str = 'apply') -> dict:
+    """Check or apply only the coupon code the customer supplied.
+
+    action=validate previews a code without changing anything; order_id may be null
+    for a validity check before a draft exists. action=apply requires a draft and
+    the customer's request to apply that specific code. Never discover, select or
+    automatically apply another code. One unexpired coupon is allowed per order.
+    """
+    if action not in ('apply', 'validate'):
+        raise BillingError('Coupon action must be apply or validate.')
+    if not isinstance(promo_code, str):
+        raise BillingError('Provide the coupon code you received.')
+    promo_code = identifier(promo_code.strip(), 'coupon code')
+    if action == 'apply' and not order_id:
+        raise BillingError('Create a draft before applying a coupon.')
     with transaction() as conn:
+        matches = conn.execute('SELECT * FROM promotions WHERE promo_code=? COLLATE NOCASE',
+                               (promo_code,)).fetchmany(2)
+        if not matches:
+            raise BillingError('Promotion not found.')
+        if len(matches) != 1:
+            raise BillingError('This coupon code has an ambiguous store definition. Ask store staff to correct it.')
+        promo = matches[0]
+        promo_code = promo['promo_code']
+        # Run the same definition and expiry checks for previews and checkout.
+        totals(conn, Decimal(0), promo_code)
+        preview = {'promo_code': promo_code, 'valid': True,
+                   'discount_type': promo['discount_type'],
+                   'discount_value': str(money(promo['discount_value'])),
+                   'expires_on': promo['expires_on']}
+        if action == 'validate' and not order_id:
+            return {**preview, 'applied': False,
+                    'note': 'Coupon checked only. No draft or invoice was changed.'}
         order = order_row(conn, order_id, customer_id)
         if is_placed(conn, order):
             raise BillingError("Promotions can only change before order placement.")
-        identifier(promo_code, 'coupon code')
         if order['promo_code'] and order['promo_code'] != promo_code:
             raise BillingError('Only one coupon code is allowed per order. A coupon is already applied.')
         lines = lines_for(conn, order_id)
@@ -182,9 +216,12 @@ def apply_promotion(order_id: str, customer_id: str, promo_code: str) -> dict:
             raise BillingError("Order has no requested items.")
         subtotal = sum((price_for(conn, line, order["order_date"]) * line["quantity"] for line in lines), Decimal(0))
         values = totals(conn, subtotal, promo_code)
+        if action == 'validate':
+            return {**preview, 'order_id': order_id, 'applied': False, **values,
+                    'note': 'Preview only. The coupon has not been applied by this check.'}
         conn.execute("UPDATE orders SET promo_code=? WHERE order_id=?", (promo_code, order_id))
         update_totals(conn, order_id, values)
-    return {"order_id": order_id, "promo_code": promo_code, **values}
+    return {"order_id": order_id, "promo_code": promo_code, 'applied': True, **values}
 
 
 @tool_result
@@ -195,7 +232,8 @@ def place_order(order_id: str, customer_id: str) -> dict:
         service=conn.execute('SELECT fulfillment_status FROM order_service WHERE order_id=?',(order_id,)).fetchone()
         if service and service[0]=='cancelled': raise BillingError('Order is cancelled. Create a new draft instead of placing it again.')
         if is_placed(conn, order):
-            return {"order_id": order_id, "invoice_number": order["order_invoice"], "already_placed": True}
+            return {"order_id": order_id, "invoice_number": order["order_invoice"], "already_placed": True,
+                    'status': 'placed', 'order_status': 'placed'}
         lines = lines_for(conn, order_id)
         if not lines:
             raise BillingError("Order has no requested items.")
@@ -223,7 +261,7 @@ def place_order(order_id: str, customer_id: str) -> dict:
         redeemed = redeem_credit(conn,order)
         update_totals(conn, order_id, values)
         invoice = "INV-" + uuid4().hex[:24].upper()
-        conn.execute("UPDATE orders SET order_invoice=? WHERE order_id=?", (invoice, order_id))
+        conn.execute("UPDATE orders SET order_invoice=?,order_status='placed' WHERE order_id=?", (invoice, order_id))
         currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()
         customer = dict(conn.execute("SELECT * FROM customers WHERE customer_id=?", (customer_id,)).fetchone())
         billing=conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?',(customer_id,)).fetchone()
@@ -236,7 +274,7 @@ def place_order(order_id: str, customer_id: str) -> dict:
         conn.execute("INSERT INTO order_service(order_id,fulfillment_status) VALUES (?,'placed') "
                      "ON CONFLICT(order_id) DO UPDATE SET fulfillment_status='placed'", (order_id,))
         due_date = conn.execute('SELECT due_date FROM order_details WHERE order_id=?', (order_id,)).fetchone()[0]
-    return {"order_id": order_id, "invoice_number": invoice, "status": "placed", **values,
+    return {"order_id": order_id, "invoice_number": invoice, "status": "placed", 'order_status': 'placed', **values,
             "currency": currency[0] if currency else 'USD', 'due_date': due_date,
             "store_credit_applied":str(redeemed),"remaining_invoice_amount":str(money(values["charged_price"])-redeemed)}
 
@@ -333,7 +371,7 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
     if action!='quote' and not reason.strip():
         raise BillingError('A refund reason of 1-2000 characters is required.')
     with transaction() as conn:
-        order = order_row(conn, order_id, customer_id)
+        order = order_row(conn, order_id, customer_id, allow_cancelled=True)
         if not is_placed(conn, order):
             raise BillingError('Only placed orders can be refunded.')
         check_return_window(conn, order)
@@ -345,6 +383,10 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
             (order_id,)).fetchone()
         currency = currency_row[0].strip().upper()
         pending = conn.execute('SELECT * FROM refund_requests WHERE order_id=?', (order_id,)).fetchone()
+        if order['order_status'] == 'cancelled':
+            cancellation = conn.execute("SELECT 1 FROM refund_details WHERE order_id=? AND request_kind='cancellation'", (order_id,)).fetchone()
+            if action != 'approve' or not pending or not cancellation:
+                raise BillingError('Cancelled orders only allow staff approval of their existing cancellation refund request.')
         if action == 'approve' and (not pending or pending['status'] != 'pending'):
             raise BillingError('An existing pending customer refund request is required before approval.')
         if pending and pending['status'] != 'pending':
@@ -381,7 +423,7 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
         if refund <= 0 or refund > money(order['charged_price']):
             raise BillingError('Refund must be positive and no greater than the invoice total.')
         if action=='quote':
-            return {'order_id':order_id,'quoted_amount':str(refund),'currency':currency,'items':selected,
+            return {'order_id':order_id,'order_status':order['order_status'],'quoted_amount':str(refund),'currency':currency,'items':selected,
                     'basis':{'subtotal':str(money(order['subtotal'])),'discount':str(money(order['discount_applied'])),'tax':str(money(order['tax_amount'])),'nonrefundable_shipping':str(money(order['shipping_amount']))},
                     'note':'Estimate only. No refund request was created or approved.'}
         if pending and (refund != money(pending['amount']) or currency != pending['currency']
@@ -428,7 +470,7 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
                 (order_id,json.dumps(selected),disposition,target_order_id,'return'))
         audit_context.get()['arguments'].update(execution_role=role, currency=currency, resolved_amount=str(refund))
         if action == 'request':
-            return {'order_id':order_id, 'requested_amount':str(refund), 'currency':currency,
+            return {'order_id':order_id, 'order_status':order['order_status'], 'requested_amount':str(refund), 'currency':currency,
                     'refund_status':'pending_approval', 'items':selected, 'disposition':disposition,
                     'calculation_basis':{'subtotal':str(money(order['subtotal'])),'discount':str(money(order['discount_applied'])),'tax':str(money(order['tax_amount'])),'nonrefundable_shipping':str(money(order['shipping_amount']))}, 'note':'Awaiting staff approval. No refund has been recorded or transferred.'}
         details=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
@@ -437,7 +479,7 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
         if details and details['disposition']=='store_credit':
             conn.execute("INSERT INTO store_credit_ledger(customer_id,order_id,currency,amount,kind) VALUES (?,?,?,?,'refund_credit')",(customer_id,order_id,currency,str(refund)))
             if details['target_order_id']:
-                target=conn.execute("SELECT o.* FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_id=? AND o.customer_id=? AND o.order_invoice IS NULL AND COALESCE(d.status,'active')!='cancelled'",(details['target_order_id'],customer_id)).fetchone()
+                target=conn.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=? AND order_status='draft'",(details['target_order_id'],customer_id)).fetchone()
                 from mcp_server.tools.service_workflows import service_action, credit_balance, currency_for
                 if target and currency_for(conn,target['order_id'])==currency:
                     prior_allocation=conn.execute('SELECT credit_requested FROM order_service WHERE order_id=?',(target['order_id'],)).fetchone()
@@ -450,7 +492,7 @@ def process_refund(order_id: str, customer_id: str, reason: str = '', amount: st
                      (str(refund), reason.strip(), order_id))
         conn.execute("UPDATE refund_requests SET status='approved',approved_at=CURRENT_TIMESTAMP,approved_by_role=? WHERE order_id=?",
                      (role, order_id))
-    return {'order_id':order_id, 'refund_amount':str(refund), 'currency':currency,
+    return {'order_id':order_id, 'order_status':order['order_status'], 'refund_amount':str(refund), 'currency':currency,
             'refund_status':'recorded', 'approved_by_role':role,
             'disposition':details['disposition'] if details else 'original_method',
             'credit_target_order_id':credited_target,
