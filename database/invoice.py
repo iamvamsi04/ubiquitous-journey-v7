@@ -34,8 +34,8 @@ def generate_invoice(invoice_number, customer_id, *, connection=None):
         lines = conn.execute("SELECT l.*,i.name FROM invoice_lines l JOIN items i ON i.item_code=l.item_code "
                              "WHERE l.order_id=? ORDER BY l.id", (order["order_id"],)).fetchall()
         if document_type=='proforma':
-            from mcp_server.tools.billing_tools import order_row,is_placed,price_for,totals
-            if is_placed(conn,order_row(conn,order['order_id'],customer_id)): raise BillingError('Pro forma is for an active unplaced draft.')
+            from mcp_server.tools.billing_tools import order_row,price_for,totals
+            if order_row(conn,order['order_id'],customer_id)['order_status'] != 'draft': raise BillingError('Pro forma is for an active unplaced draft.')
             lines=[]
             for r in conn.execute('SELECT r.*,i.name,i.sellingprice FROM order_requests r JOIN items i ON i.item_code=r.item_code WHERE r.order_id=? ORDER BY r.id',(order['order_id'],)):
                 price=price_for(conn,r,order['order_date'])
