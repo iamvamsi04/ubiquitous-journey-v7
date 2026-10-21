@@ -97,11 +97,11 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
     if role=='admin' and action not in ('ship','deliver'): raise BillingError('Admin order access permits only confirmed shipment/delivery transitions.')
     if action in ('ship','deliver') and role!='admin': raise BillingError('Only authenticated admin may update fulfillment status.')
     with transaction() as conn:
-        existing_meta = conn.execute('SELECT status FROM order_details WHERE order_id=?', (order_id,)).fetchone()
-        if existing_meta and existing_meta['status'] == 'cancelled' and action == 'cancel':
+        existing_meta = conn.execute('SELECT order_status FROM orders WHERE order_id=?', (order_id,)).fetchone()
+        if existing_meta and existing_meta['order_status'] == 'cancelled' and action == 'cancel':
             owner = conn.execute('SELECT customer_id FROM orders WHERE order_id=?', (order_id,)).fetchone()
             if owner and owner[0] == customer_id:
-                return {'order_id': order_id, 'status': 'cancelled', 'already_cancelled': True}
+                return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled', 'already_cancelled': True}
         order = order_row(conn, order_id, customer_id)
         if action in ('ship','deliver'):
             from mcp_server.tools.service_workflows import fulfillment_transition
@@ -120,7 +120,8 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
             conn.execute("INSERT INTO order_details(order_id,currency,status,cancellation_reason) VALUES (?,?,'cancelled',?) "
                          "ON CONFLICT(order_id) DO UPDATE SET status='cancelled',cancellation_reason=excluded.cancellation_reason",
                          (order_id, currency, reason))
-            return {'order_id': order_id, 'status': 'cancelled', 'reason': reason}
+            conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (order_id,))
+            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled', 'reason': reason}
         if action != 'replace_items' or not isinstance(items, list) or not 1 <= len(items) <= 100:
             raise BillingError('Use cancel or replace_items with 1-100 line items.')
         quantities = {}
@@ -145,6 +146,6 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
         conn.executemany('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',
                          [(order_id, code, qty) for code, qty in quantities.items()])
         update_totals(conn, order_id, values)
-        return {'order_id': order_id, 'status': 'requested', 'estimate': values}
+        return {'order_id': order_id, 'status': 'draft', 'order_status': 'draft', 'estimate': values}
 
 
