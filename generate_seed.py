@@ -1,4 +1,4 @@
-"""Create a complete billing dataset, atomically and without Azure.
+"""Create a complete billing dataset without Azure.
 
 Run: python generate_seed.py
 Options: --db database/store.db --seed 42 --as-of 2026-10-08
@@ -9,16 +9,22 @@ Upgrades existing datasets with product details and service scenarios.
 Seed markers make reruns repeatable without duplicate inserts.
 Each generated customer initially uses <customer_id>-Store!2026 to sign in.
 Only salted password hashes are saved; existing passwords are preserved.
+Billing records are validated and committed first. Password setup runs in
+parallel batches and resumes missing accounts after an interruption.
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING
 import json
+import os
 from pathlib import Path
 import random
 import sqlite3
+import sys
+from time import perf_counter
 
 from config import settings
 from database.service_seed import seed_layout
@@ -30,6 +36,8 @@ TABLES = (*MAIN_COUNTS, "price_history", "promotions", "billing_config", "order_
           "product_details", "product_attributes", "product_relations", "billing_audit", "customer_credentials")
 MARKER = "billing_seed_v1"
 ENRICHMENT_MARKER = 'billing_seed_v2'
+PASSWORD_BATCH_SIZE = 25
+PASSWORD_WORKERS = min(4, os.cpu_count() or 1)
 FIRST = "Alex Jamie Sam Taylor Morgan Jordan Casey Avery Riley Cameron Quinn Devon".split()
 LAST = "Morgan Chen Rivera Reed Patel Smith Lewis Brooks Park Carter Diaz Evans".split()
 PRODUCTS = [
@@ -256,7 +264,7 @@ def audit(conn, opening_stock):
                     f"{code} overlapping price history.")
 
 
-def seed_customer_passwords(conn):
+def seed_customer_passwords(conn, workers=PASSWORD_WORKERS, progress=None):
     """Assign initial passwords only to generated accounts that lack credentials."""
     from api.customer_auth import password_hash
     prefix = seed_layout(conn)[0]
@@ -265,14 +273,52 @@ def seed_customer_passwords(conn):
         'ON a.customer_id=c.customer_id WHERE a.customer_id IS NULL '
         'AND c.customer_id GLOB ? ORDER BY c.customer_id',
         (prefix + '-CUST-[0-9][0-9][0-9][0-9]',)).fetchall()
-    for row in missing:
-        customer_id = row[0]
-        conn.execute('INSERT INTO customer_credentials(customer_id,password_hash) VALUES (?,?)',
-                     (customer_id, password_hash(customer_id + '-Store!2026')))
-    return len(missing)
+    if not missing:
+        if progress:
+            progress('All generated customers already have passwords.')
+        return 0
+    if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 4:
+        raise ValueError('Password workers must be between 1 and 4.')
+    if progress:
+        progress(f'Preparing {len(missing)} customer passwords with {workers} workers.')
+    added = 0
+    last_update = perf_counter()
+    # SQLite stays on this thread. Workers only calculate hashes; no write lock
+    # is held during the expensive calculations.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start in range(0, len(missing), PASSWORD_BATCH_SIZE):
+            batch = missing[start:start + PASSWORD_BATCH_SIZE]
+            pending = {pool.submit(password_hash, row[0] + '-Store!2026'): row[0] for row in batch}
+            prepared = []
+            try:
+                for job in as_completed(pending):
+                    prepared.append((pending[job], job.result()))
+                    if progress and perf_counter() - last_update >= 2:
+                        progress(f'Password hashes prepared: {start + len(prepared)}/{len(missing)}.')
+                        last_update = perf_counter()
+            except BaseException:
+                for job in pending:
+                    job.cancel()
+                raise
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                for customer_id, encoded in sorted(prepared):
+                    # A password set by another process while hashing always wins.
+                    inserted = conn.execute(
+                        'INSERT OR IGNORE INTO customer_credentials(customer_id,password_hash) '
+                        'SELECT customer_id,? FROM customers WHERE customer_id=?', (encoded, customer_id))
+                    added += inserted.rowcount
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            if progress:
+                progress(f'Password accounts checked: {start + len(batch)}/{len(missing)}; {added} added.')
+                last_update = perf_counter()
+    return added
 
 
-def generate(db_path: Path, seed: int, as_of: date):
+def generate_records(db_path: Path, seed: int, as_of: date):
     db_path = db_path.resolve()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
@@ -295,9 +341,7 @@ def generate(db_path: Path, seed: int, as_of: date):
         if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (enrichment_marker,)).fetchone():
             from database.service_seed import seed_service_scenarios
             seed_service_scenarios(conn,as_of,create_scenario_order)
-            passwords_added = seed_customer_passwords(conn)
             result = {"status": "already_seeded", "database": str(db_path), "rows": counts(conn), 'scenarios':scenarios(conn), 'retired_records_backup':backup}
-            result['customer_passwords_added'] = passwords_added
             conn.commit()
             return result
         if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (marker,)).fetchone():
@@ -305,12 +349,10 @@ def generate(db_path: Path, seed: int, as_of: date):
             enrich(conn,as_of)
             audit_enrichment(conn)
             conn.execute('INSERT INTO billing_config VALUES (?,?)',(enrichment_marker,f'seed={seed};as_of={as_of.isoformat()}'))
-            passwords_added = seed_customer_passwords(conn)
             after = counts(conn)
             result = {'status':'upgraded','database':str(db_path),'rows':after,
                       'added':{table:after[table]-before[table] for table in TABLES},
                       'scenarios':scenarios(conn),'validated':True,'retired_records_backup':backup}
-            result['customer_passwords_added'] = passwords_added
             conn.commit()
             return result
         before = counts(conn)
@@ -405,14 +447,12 @@ def generate(db_path: Path, seed: int, as_of: date):
         audit_enrichment(conn)
         conn.execute("INSERT INTO billing_config(key,value) VALUES (?,?)", (marker, f"seed={seed};as_of={as_of.isoformat()}"))
         conn.execute("INSERT INTO billing_config(key,value) VALUES (?,?)", (enrichment_marker, f"seed={seed};as_of={as_of.isoformat()}"))
-        passwords_added = seed_customer_passwords(conn)
         after = counts(conn)
         result = {"status": "inserted", "database": str(db_path), "rows": after,
                   "added": {table: after[table]-before[table] for table in TABLES},
                   "placed_orders_added": 307, "draft_orders_added": 51,
                   "ledger_refunds_added": refund_counts, "validated": True,
                   'scenarios':scenarios(conn),'retired_records_backup':backup}
-        result['customer_passwords_added'] = passwords_added
         conn.commit()
         return result
     except BaseException:
@@ -422,15 +462,60 @@ def generate(db_path: Path, seed: int, as_of: date):
         conn.close()
 
 
+class PasswordSetupError(RuntimeError):
+    pass
+
+
+def generate(db_path: Path, seed: int, as_of: date, progress=None, password_workers=PASSWORD_WORKERS):
+    if not isinstance(password_workers, int) or isinstance(password_workers, bool) or not 1 <= password_workers <= 4:
+        raise ValueError('Password workers must be between 1 and 4.')
+    started = perf_counter()
+    if progress:
+        progress(f'Preparing database: {db_path.resolve()}')
+    result = generate_records(db_path, seed, as_of)
+    if progress:
+        progress(f"Billing records saved: {result['rows']['customers']} customers, "
+                 f"{result['rows']['items']} products, {result['rows']['orders']} orders.")
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path.resolve(), timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys=ON')
+        added = seed_customer_passwords(conn, password_workers, progress)
+        result['customer_passwords_added'] = added
+        result['rows']['customer_credentials'] = conn.execute('SELECT COUNT(*) FROM customer_credentials').fetchone()[0]
+        if 'added' in result:
+            result['added']['customer_credentials'] += added
+    except Exception as exc:
+        raise PasswordSetupError('Billing records and completed password batches are saved. '
+                                 'Rerun the same command to finish missing passwords.') from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    result['elapsed_seconds'] = round(perf_counter() - started, 3)
+    if progress:
+        progress(f"Finished in {result['elapsed_seconds']:.2f} seconds.")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", type=Path, default=settings.BILLING_DB, help="SQLite file; relative paths use the project folder.")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic random seed.")
     parser.add_argument("--as-of", type=date.fromisoformat, default=date.today(), help="Order date anchor, YYYY-MM-DD.")
+    parser.add_argument('--password-workers', type=int, choices=range(1, 5), default=PASSWORD_WORKERS,
+                        help='Parallel password hashing workers (default: up to 4 CPU cores).')
     args = parser.parse_args()
     path = args.db if args.db.is_absolute() else settings.ROOT / args.db
     try:
-        print(json.dumps(generate(path, args.seed, args.as_of), indent=2))
+        result = generate(path, args.seed, args.as_of,
+                          progress=lambda message: print(message, file=sys.stderr, flush=True),
+                          password_workers=args.password_workers)
+        print(json.dumps(result, indent=2))
+    except PasswordSetupError as exc:
+        parser.exit(1, f'Password setup stopped: {exc}\nCause: {exc.__cause__}\n')
+    except KeyboardInterrupt:
+        parser.exit(130, '\nStopped. Rerun the same command to resume. Completed records and password batches are saved.\n')
     except (ValueError, sqlite3.Error, ArithmeticError) as exc:
         parser.exit(1, f"Seed records rolled back: {exc}\nRetired-table cleanup, if applied, is a separate migration.\n")
 
