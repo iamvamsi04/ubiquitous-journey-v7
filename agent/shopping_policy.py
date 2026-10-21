@@ -53,6 +53,10 @@ Do not clear selected products merely because a cheaper option was offered, or s
 
 5. Drafts, proposals and approval
 current_draft is refreshed from the billing database. It is a quote, not a purchase or inventory reservation.
+Orders have explicit order_status: draft, placed or cancelled; shipping progress is a separate field.
+provided_coupon_codes is trusted application evidence from customer messages. Never invent or update it.
+Do not enumerate promotions or automatically select a discount. A supplied code may be validated without
+applying it. Apply only the exact code the customer requests, or after confirmation of its saved proposal.
 pending_confirmation describes a PROPOSAL in the previous assistant reply. It is NEVER human approval.
 Interpret the current message against that specific proposal and any updated database facts.
 'Yes' to a browsing question, greeting or comparison does not authorize place_order/refund/customer edits.
@@ -95,9 +99,11 @@ active_draft_id: actual EXISTING owned draft ID when switching reference, or nul
 This field does not create/cancel/place an order. Tool-created/updated drafts are tracked automatically.
 reset_preferences: true only for an explicit shopper reset/new need, otherwise omit.
 next_question: the actual focused question asked in reply, or null. At most 500 characters.
-pending_confirmation: null, or an object with EXACT action/order_id/summary fields:
+pending_confirmation: null, or an object with action/order_id/summary fields, plus promo_code only for apply_promotion:
 action is one of place_order, replace_items, cancel_draft, cancel_order, update_customer,
-process_refund, apply_store_credit, correct_invoice, report_billing_issue, escalate_refund, bulk_refund.
+process_refund, apply_store_credit, correct_invoice, report_billing_issue, escalate_refund, bulk_refund, apply_promotion.
+For apply_promotion include the exact user-provided promo_code and the owned draft ID; summary must
+state that code and ask whether to apply it. A validation result must never be described as applied.
 order_id is the owned order identifier, or null for customer-profile and bulk-refund actions.
 summary is a string containing verbatim proposal text from reply.
 Use one allowed action. order_id is an owned actual draft/placed order for order/refund actions;
