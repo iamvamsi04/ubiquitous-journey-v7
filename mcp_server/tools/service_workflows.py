@@ -70,7 +70,7 @@ def refund_status(order_id,customer_id,action,reason='',confirmed=False):
     if action=='escalate' and (confirmed is not True or not reason.strip() or len(reason)>2000):
         raise BillingError('Confirm escalation and provide a review reason of at most 2000 characters.')
     with transaction() as conn:
-        order=order_row(conn,order_id,customer_id)
+        order=order_row(conn,order_id,customer_id,allow_cancelled=True)
         request=conn.execute('SELECT * FROM refund_requests WHERE order_id=?',(order_id,)).fetchone()
         if not request and order['refund_amount'] is None: raise BillingError('No refund request or recorded refund exists for this order.')
         if action=='escalate':
@@ -78,7 +78,7 @@ def refund_status(order_id,customer_id,action,reason='',confirmed=False):
             conn.execute('INSERT OR IGNORE INTO refund_details(order_id) VALUES (?)',(order_id,))
             conn.execute('UPDATE refund_details SET escalated_at=COALESCE(escalated_at,CURRENT_TIMESTAMP),escalation_note=? WHERE order_id=?',(reason.strip(),order_id))
         details=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
-        return {'order_id':order_id,'local_status':request['status'] if request else 'legacy_recorded',
+        return {'order_id':order_id,'order_status':order['order_status'],'local_status':request['status'] if request else 'legacy_recorded',
             'requested_amount':str(money(request['amount'])) if request else None,
             'recorded_amount':str(money(order['refund_amount'])) if order['refund_amount'] is not None else None,
             'approved_at':request['approved_at'] if request else None,
@@ -96,7 +96,7 @@ def cancel_placed(conn,order,reason):
     oid=order['order_id']; service=conn.execute('SELECT * FROM order_service WHERE order_id=?',(oid,)).fetchone()
     if not service or service['fulfillment_status']=='unknown': raise BillingError('Shipment status is not recorded. Staff must verify it before cancellation.')
     state=service['fulfillment_status']
-    if state=='cancelled': return {'order_id':oid,'status':'cancelled','already_cancelled':True}
+    if state=='cancelled': return {'order_id':oid,'status':'cancelled','order_status':'cancelled','already_cancelled':True}
     check_return_window(conn,order)
     if state in ('shipped','delivered'): raise BillingError('This order has shipped. Cancellation is unavailable; request a return instead.')
     if order['refund_status'] or order['refund_amount'] is not None or conn.execute('SELECT 1 FROM refund_requests WHERE order_id=?',(oid,)).fetchone():
@@ -109,13 +109,14 @@ def cancel_placed(conn,order,reason):
     if quantities != fulfilled:
         raise BillingError('Fulfilled and billed quantities do not match. Staff review is required before cancellation.')
     conn.execute("INSERT INTO order_service(order_id,fulfillment_status,cancelled_at,cancellation_restocked) VALUES (?,'cancelled',CURRENT_TIMESTAMP,1) ON CONFLICT(order_id) DO UPDATE SET fulfillment_status='cancelled',cancelled_at=CURRENT_TIMESTAMP,cancellation_restocked=1",(oid,))
+    conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (oid,))
     for line in conn.execute('SELECT item_code,quantity FROM order_fulfilled WHERE order_id=?',(oid,)).fetchall():
         conn.execute('UPDATE items SET availablequantity=availablequantity+? WHERE item_code=?',(line['quantity'],line['item_code']))
     currency=currency_for(conn,oid)
     conn.execute('INSERT INTO refund_requests(order_id,amount,currency,reason) VALUES (?,?,?,?)',(oid,str(money(order['charged_price'])),currency,reason))
     used_credit=conn.execute("SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",(oid,)).fetchone()
     conn.execute("INSERT INTO refund_details(order_id,request_kind,disposition) VALUES (?,'cancellation',?)",(oid,'store_credit' if used_credit else 'original_method'))
-    return {'order_id':oid,'status':'cancelled','refund_status':'pending_approval','requested_amount':str(money(order['charged_price'])),
+    return {'order_id':oid,'status':'cancelled','order_status':'cancelled','refund_status':'pending_approval','requested_amount':str(money(order['charged_price'])),
             'currency':currency,'note':'Whole unshipped order cancelled. Invoice retained; refund awaits staff approval. Policy estimate is 5-10 business days after staff handling; no transfer was made.'}
 
 
@@ -124,13 +125,13 @@ def service_action(conn,order,action,reason,credit_amount):
     if action=='report_billing_issue':
         if not reason.strip() or len(reason)>2000: raise BillingError('Provide a billing review reason of 1-2000 characters.')
         conn.execute('INSERT INTO order_service(order_id,review_note,review_requested_at) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(order_id) DO UPDATE SET review_note=excluded.review_note,review_requested_at=CURRENT_TIMESTAMP',(oid,reason.strip()))
-        return {'order_id':oid,'review_reference':f'BILLING-REVIEW-{oid}','note':'Customer-reported issue recorded for staff review. Actual charges are not verified.'}
+        return {'order_id':oid,'order_status':order['order_status'],'review_reference':f'BILLING-REVIEW-{oid}','note':'Customer-reported issue recorded for staff review. Actual charges are not verified.'}
     if is_placed(conn,order): raise BillingError('Store credit can only be applied to an active draft.')
     amount=money(credit_amount) if credit_amount is not None else None
     if amount is None or amount>money(order['charged_price']): raise BillingError('Credit amount must be nonnegative and no greater than the draft total; use zero to clear it.')
     if amount>credit_balance(conn,order['customer_id'],currency): raise BillingError('Insufficient store credit in this currency.')
     conn.execute('INSERT INTO order_service(order_id,credit_requested) VALUES (?,?) ON CONFLICT(order_id) DO UPDATE SET credit_requested=excluded.credit_requested',(oid,str(amount)))
-    return {'order_id':oid,'currency':currency,'credit_requested':str(amount), 'remaining_invoice_amount':str(money(order['charged_price'])-amount),
+    return {'order_id':oid,'order_status':'draft','currency':currency,'credit_requested':str(amount), 'remaining_invoice_amount':str(money(order['charged_price'])-amount),
             'note':'Credit allocation saved on draft; available balance is rechecked and redeemed once at placement.'}
 
 
@@ -237,13 +238,13 @@ def fulfillment_transition(conn,order,action):
     state=row[0] if row else 'unknown'
     if state=='unknown': raise BillingError('Shipment status is unknown. Staff must verify the recorded state before advancing fulfillment.')
     target='shipped' if action=='ship' else 'delivered'
-    if state==target: return {'order_id':oid,'fulfillment_status':target,'already_recorded':True}
+    if state==target: return {'order_id':oid,'order_status':order['order_status'],'fulfillment_status':target,'already_recorded':True}
     if (state,target) not in (('placed','shipped'),('shipped','delivered')): raise BillingError('Invalid fulfillment transition; delivery requires shipment and cancelled orders cannot ship.')
     if conn.execute("SELECT 1 FROM refund_requests WHERE order_id=? AND status='pending'",(oid,)).fetchone(): raise BillingError('Pending refund must be reviewed before fulfillment.')
     conn.execute('INSERT OR IGNORE INTO order_service(order_id) VALUES (?)',(oid,))
     column='shipped_at' if action=='ship' else 'delivered_at'
     conn.execute(f'UPDATE order_service SET fulfillment_status=?,{column}=CURRENT_TIMESTAMP WHERE order_id=?',(target,oid))
-    return {'order_id':oid,'fulfillment_status':target}
+    return {'order_id':oid,'order_status':order['order_status'],'fulfillment_status':target}
 
 
 def bulk_refunds(customer_id,date_from,date_to,action,reason,confirmed,disposition):
