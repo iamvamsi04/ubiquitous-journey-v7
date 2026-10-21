@@ -25,7 +25,7 @@ def seed_service_scenarios(conn,as_of,create_order):
         item=conn.execute("SELECT item_code FROM items WHERE item_code GLOB ? AND availablequantity>=? ORDER BY sellingprice DESC,item_code LIMIT 1",(prefix+'-ITEM-*',qty)).fetchone()
         if item is None: raise ValueError('Insufficient stock for service scenario.')
         create_order(conn,oid,customer,[(item[0],qty)],as_of,placed=True)
-        conn.execute('UPDATE orders SET order_invoice=? WHERE order_id=?',('INV-'+oid,oid))
+        conn.execute("UPDATE orders SET order_invoice=?,order_status='placed' WHERE order_id=?",('INV-'+oid,oid))
         currency=conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
         contact=dict(conn.execute('SELECT * FROM customers WHERE customer_id=?',(customer,)).fetchone())
         contact.update(billing_address='100 Market Road, Springfield',tax_registration_number='TAX-001')
