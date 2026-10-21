@@ -27,8 +27,9 @@ class Proposal(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: Literal['place_order', 'replace_items', 'cancel_draft',
                     'update_customer', 'process_refund', 'cancel_order', 'apply_store_credit',
-                    'correct_invoice', 'report_billing_issue', 'escalate_refund', 'bulk_refund']
+                    'correct_invoice', 'report_billing_issue', 'escalate_refund', 'bulk_refund', 'apply_promotion']
     order_id: ProductID | None = None
+    promo_code: ProductID | None = None
     summary: str = Field(min_length=1, max_length=1500)
 
 
@@ -59,7 +60,7 @@ def empty_state():
             'preferred_features': {}, 'quantity': None, 'known_products': [],
             'compared_product_ids': [], 'displayed_product_ids': [], 'selected_product_ids': [],
             'current_draft': None, 'last_order': None, 'pending_confirmation': None,
-            'next_question': None, 'product_query': None}
+            'next_question': None, 'product_query': None, 'provided_coupon_codes': []}
 
 
 def order_snapshot(order_id, customer_id):
@@ -73,7 +74,7 @@ def order_snapshot(order_id, customer_id):
         if row is None:
             return None
         service=conn.execute('SELECT fulfillment_status,credit_requested,shipped_at,delivered_at,cancelled_at FROM order_service WHERE order_id=?',(order_id,)).fetchone()
-        state = 'cancelled' if row['status']=='cancelled' or (service and service[0]=='cancelled') else 'placed' if row['order_invoice'] else 'draft'
+        state = row['order_status']
         currency = row['currency'] or conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
         result = {'order_id': row['order_id'], 'order_date': row['order_date'], 'status': state, 'invoice_number': row['order_invoice'],
                   'currency': currency, 'promo_code': row['promo_code'],
@@ -178,6 +179,9 @@ class ShoppingTracker:
                 'truncated': result.get('truncated', False)}
             index = result['columns'].index('item_code')
             self.remember_products([row[index] for row in result.get('rows', [])])
+        elif name == 'apply_promotion' and result.get('applied') is False:
+            # Checking a code is not a basket change, even when its preview has totals.
+            pass
         elif name in ('request_order','manage_draft','apply_promotion','place_order','process_refund'):
             snapshot = order_snapshot(result.get('order_id'), customer_id)
             if name != 'process_refund':
@@ -270,6 +274,8 @@ class ShoppingTracker:
                 eligible = eligible and bool(order['invoice_number'])
             elif action == 'escalate_refund':
                 eligible = eligible and bool(order['refund_request'])
+            elif action == 'apply_promotion':
+                eligible = eligible and bool(proposed.get('promo_code')) and proposed['promo_code'].upper() in self.state['provided_coupon_codes']
             if ((account_action and not order_id and self.customer_id) or (bulk_action and not order_id and self.customer_id) or
                     (not account_action and not bulk_action and eligible)):
                 proposed['status'] = 'awaiting_customer'
