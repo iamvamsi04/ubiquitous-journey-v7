@@ -46,9 +46,17 @@ def health_status(api, api_key):
     cached=st.session_state.get('_health_cache')
     if cached and cached[:2]==(api,api_key) and monotonic()-cached[2]<15:
         return cached[3]
-    result = api_client().get(api + '/health', headers={'X-API-Key':api_key})
-    result.raise_for_status()
+    failed=st.session_state.get('_health_failure')
+    if failed and failed[:2]==(api,api_key) and monotonic()-failed[2]<3:
+        raise httpx.ConnectError('The API health check is temporarily unavailable.')
+    try:
+        result = api_client().get(api + '/health', headers={'X-API-Key':api_key}, timeout=2.0)
+        result.raise_for_status()
+    except httpx.HTTPError:
+        st.session_state['_health_failure']=(api,api_key,monotonic())
+        raise
     data=result.json()
+    st.session_state.pop('_health_failure',None)
     st.session_state['_health_cache']=(api,api_key,monotonic(),data)
     return data
 
