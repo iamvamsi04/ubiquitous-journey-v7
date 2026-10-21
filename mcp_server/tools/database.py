@@ -7,6 +7,7 @@ from collections import OrderedDict
 from threading import RLock
 from config import settings
 from database.connection import connect
+from database.product_search import normalize_product_filters, register_product_search
 
 TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
           'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
@@ -17,7 +18,8 @@ FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnu
                 'instr julianday length like lower ltrim max min nullif printf replace '
                 'round rtrim strftime substr substring sum time total trim typeof '
                 'unicode upper row_number rank dense_rank lag lead first_value last_value '
-                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp'.split())
+                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp '
+                'product_text product_matches product_like'.split())
 
 # Store schema text only. Each lookup still checks the current database file and
 # SQLite schema version; prices, customers and other business rows are never cached.
@@ -71,6 +73,8 @@ def schema_hint(mode='customer'):
                     _schema_cache.move_to_end(key)
                     return cached
         tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
+        if mode == 'customer':
+            tables = [table for table in tables if table != 'promotions']
         columns = {}
         for table in tables:
             names = [r['name'] for r in conn.execute(f'PRAGMA table_info("{table}")')]
@@ -88,6 +92,7 @@ def schema_hint(mode='customer'):
                     joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
         lines.append('Declared join keys: ' + '; '.join(joins))
         lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
+        lines.append('Product search: product_matches(i.name, ?) or product_matches(d.category, ?) matches words/phrases regardless of case, spaces, underscores, hyphens and common plurals. Use only on product text; IDs, prices and other fields keep exact semantics.')
         hint = '\n'.join(lines)
         if unchanged and identity == _database_identity(path):
             with _schema_cache_lock:
@@ -116,6 +121,10 @@ def execute_sql_query(query: str | None = None, chart: dict | None = None, param
     """Answer flexible questions with one read-only SELECT/WITH or PRAGMA table_info(table).
 
     Product discovery uses qualified SQL against items and optional product_details.
+    Search names/categories with product_matches(i.name, ?) or product_matches(d.category, ?).
+    It normalizes case, spaces, underscores, hyphens and common plurals; it matches whole words/phrases.
+    Simple name/category equality, IN and LIKE filters are normalized locally, without changing stored labels.
+    Keep item codes, SKUs, customer IDs and financial fields exact. Ambiguous products need clarification.
     Count all matching products before displaying a page. Use stable ordering and LIMIT/OFFSET.
     Include out-of-stock products unless explicitly filtered. Preserve scope on next-page requests.
     Use effective price_history for current prices; overlapping prices are unknown, never guessed.
@@ -150,6 +159,7 @@ def execute_sql_query(query: str | None = None, chart: dict | None = None, param
     conn = (customer_query_connection(access['customer_id'], staff=access['mode'] == 'cashier')
             if access and access['mode'] in ('customer', 'cashier') else connect(readonly=True))
     try:
+        register_product_search(conn)
         conn.execute('PRAGMA query_only=ON')
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000000)
         conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20000)
@@ -157,6 +167,8 @@ def execute_sql_query(query: str | None = None, chart: dict | None = None, param
         deadline = time.monotonic() + 2
         conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         conn.set_authorizer(authorize)
+        original_query = query
+        query = normalize_product_filters(query)
         repaired_aliases = False
         try:
             cursor = conn.execute(query, parameters or [])
@@ -178,6 +190,8 @@ def execute_sql_query(query: str | None = None, chart: dict | None = None, param
                 'coverage_note': 'row_count counts returned SQL rows only. SQL LIMIT and filters may exclude matches even when truncated is false. Count the full matching set separately before claiming completeness, absence or a store-wide total.'}
         if repaired_aliases:
             result['query_note'] = 'Quoted reserved SQL aliases locally. Use names such as series_label instead of group/order in future queries.'
+        if query != original_query:
+            result['product_search_note'] = 'Product name/category filters ignore case, separators and common plural endings. IDs and financial filters retain their original semantics.'
         if chart is not None:
             from mcp_server.charts import prepare_chart
             try:
