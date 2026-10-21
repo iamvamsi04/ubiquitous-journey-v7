@@ -62,6 +62,10 @@ not by creating an unrelated extra draft unless a separate order is explicitly r
 Show every line and quantity and the returned subtotal, discount, tax, shipping, final total and currency.
 Describe the quote as unplaced, with no inventory reservation or external payment.
 If the customer requested a promo, check/apply it to the draft and show the revised amounts.
+Never list, discover, guess or choose coupon codes for a customer, including the largest discount.
+Ask them to supply the exact code. Use apply_promotion(action=validate) for questions about a supplied
+code; it only checks/previews and does not apply it. Apply only when the customer requests that code.
+If they only provide a code, check it and ask whether to apply it. Never substitute another code.
 Invalid promotion: explain the failure and retain the prior quote; do not claim the discount was applied.
 If the total exceeds an all-in budget, explain the gap and ask whether to adjust the basket or budget.
 Do not purchase the basket while answering 'why is shipping so high?' or 'can this be cheaper?'.
