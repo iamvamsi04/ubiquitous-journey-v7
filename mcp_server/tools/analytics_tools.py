@@ -37,7 +37,8 @@ def result(fn):
 
 
 def filters(customer_id, order_id, date_from, date_to):
-    clauses, values = ["NOT EXISTS (SELECT 1 FROM order_details d WHERE d.order_id=o.order_id AND d.status='cancelled')",
+    clauses, values = ["o.order_status!='cancelled'",
+                       "NOT EXISTS (SELECT 1 FROM order_details d WHERE d.order_id=o.order_id AND d.status='cancelled')",
                        "NOT EXISTS (SELECT 1 FROM order_service s WHERE s.order_id=o.order_id AND s.fulfillment_status='cancelled')"], []
     for name, value in (("customer_id", customer_id), ("order_id", order_id)):
         if value is not None:
@@ -92,7 +93,7 @@ def snapshot(customer_id, order_id, date_from, date_to):
         fallback = str(config.get('currency', 'USD')).strip().upper()
         currencies = {r[0] for r in conn.execute(
             f"SELECT DISTINCT COALESCE(NULLIF(UPPER(TRIM(d.currency)),''),?) FROM orders o LEFT JOIN order_details d "
-            f"ON d.order_id=o.order_id WHERE o.order_invoice IS NOT NULL AND {where}",
+            f"ON d.order_id=o.order_id WHERE o.order_status='placed' AND {where}",
             [fallback, *args])}
         if any(not c or len(c)!=3 or not c.isascii() or not c.isalpha() for c in currencies):
             raise ValueError('An invoice has missing or invalid currency. Correct it before analyzing totals.')
@@ -115,7 +116,7 @@ def group(rows):
 
 
 def invoiced(order):
-    return bool(order["order_invoice"])
+    return order['order_status'] == 'placed' and bool((order['order_invoice'] or '').strip())
 
 
 def summary(orders):
@@ -222,7 +223,7 @@ def invoice_trend(customer_id, order_id, date_from, date_to, period, metric, cha
         records = conn.execute('SELECT o.*, COALESCE(NULLIF(UPPER(TRIM(d.currency)),\'\'), '
             '(SELECT NULLIF(UPPER(TRIM(value)),\'\') FROM billing_config WHERE key=\'currency\')) AS report_currency '
             'FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE '
-            + where + ' AND o.order_invoice IS NOT NULL ORDER BY o.order_date,o.order_id LIMIT ?', [*args,LIMIT+1]).fetchall()
+            + where + " AND o.order_status='placed' ORDER BY o.order_date,o.order_id LIMIT ?", [*args,LIMIT+1]).fetchall()
     finally:
         conn.close()
     if len(records)>LIMIT:
