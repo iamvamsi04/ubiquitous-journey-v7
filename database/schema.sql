@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS orders (
     order_date DATE NOT NULL DEFAULT CURRENT_DATE,
     customer_id VARCHAR(50) NOT NULL REFERENCES customers(customer_id),
     order_invoice VARCHAR(100),
+    order_status TEXT NOT NULL DEFAULT 'draft' CHECK(order_status IN ('draft','placed','cancelled')),
     subtotal DECIMAL(10,2) NOT NULL CHECK(subtotal >= 0),
     tax_amount DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(tax_amount >= 0),
     shipping_amount DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(shipping_amount >= 0),
