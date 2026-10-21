@@ -25,6 +25,7 @@ from mcp_server.access import ADMIN_TOOLS, CASHIER_TOOLS, CUSTOMER_TOOLS, SCOPE_
 from context.reply_text import REPLY_POLICY, plain_reply
 from context.shopping_state import ShoppingTracker
 from agent.shopping_policy import shopping_prompt
+from agent.coupon_policy import customer_coupon_codes, may_apply_coupon
 
 
 log = logging.getLogger("uvicorn.error.billing_performance")
@@ -35,6 +36,7 @@ BATCH_READ_TOOLS = frozenset({'execute_sql_query', 'compare_products',
     'find_cheaper_alternatives', 'billing_analysis', 'billing_anomalies'})
 BATCH_POLICY = ('\nYou may request multiple independent read-only tools in one round. '
     'Use a later round when arguments depend on an earlier result. '
+    'Coupon checks with action=validate may also be batched. '
     'Request writes and invoice generation one tool at a time; never batch them.\n')
 
 
@@ -94,6 +96,9 @@ class RecordingWorkbench(McpWorkbench):
         self.mode = 'customer'
         self.customer_id = None
         self.shopping_tracker = None
+        self.coupon_codes = []
+        self.user_message = ''
+        self.coupon_proposal = None
         self.tool_seconds = 0.0
         self.tool_calls = 0
         self._batch_blocked = False
@@ -101,8 +106,17 @@ class RecordingWorkbench(McpWorkbench):
 
     def prepare_batch(self, content):
         calls = content if isinstance(content, list) else []
-        self._batch_blocked = len(calls) > 1 and any(
-            getattr(call, 'name', None) not in BATCH_READ_TOOLS for call in calls)
+        def read_only(call):
+            if getattr(call, 'name', None) in BATCH_READ_TOOLS:
+                return True
+            if getattr(call, 'name', None) == 'apply_promotion':
+                try:
+                    arguments = json.loads(call.arguments)
+                    return isinstance(arguments, dict) and arguments.get('action') == 'validate'
+                except (ValueError, TypeError, AttributeError):
+                    return False
+            return False
+        self._batch_blocked = len(calls) > 1 and any(not read_only(call) for call in calls)
         if len(calls) > 1:
             log.info('billing_batch calls=%s allowed=%s', len(calls), not self._batch_blocked)
 
@@ -148,9 +162,16 @@ class RecordingWorkbench(McpWorkbench):
             return await self._call_tool(name, arguments, cancellation_token, **kwargs)
 
     async def _call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
+        if self.mode == 'customer' and name == 'apply_promotion' and (arguments or {}).get('action', 'apply') == 'apply':
+            if not may_apply_coupon((arguments or {}).get('promo_code'), (arguments or {}).get('order_id'),
+                                    self.user_message, self.coupon_codes, self.coupon_proposal):
+                return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
+                    'ok': False, 'error': 'Apply only the exact coupon supplied and requested by the customer. '
+                    'Use action=validate for a code question, or ask which code they want applied. No discount changed.'}))])
         # The model cannot choose its execution role or customer scope.
         arguments = {**(arguments or {}), 'execution_mode': self.mode,
-                     'execution_customer_id': self.customer_id}
+                     'execution_customer_id': self.customer_id,
+                     'execution_coupon_codes': list(self.coupon_codes)}
         started = perf_counter()
         try:
             result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
@@ -314,6 +335,12 @@ class BillingAgent:
                 workbench.prepare_batch(None)
                 tracker = ShoppingTracker(shopping_state, customer_id, state_callback) if mode == 'customer' else None
                 workbench.shopping_tracker = tracker
+                workbench.user_message = message
+                workbench.coupon_proposal = deepcopy(tracker.state['pending_confirmation']) if tracker else None
+                workbench.coupon_codes = customer_coupon_codes(message, history,
+                    tracker.state.get('provided_coupon_codes', [])) if tracker else []
+                if tracker:
+                    tracker.state['provided_coupon_codes'] = list(workbench.coupon_codes)
                 memory_prompt = shopping_prompt(tracker.state) if tracker else ''
                 # A new user turn invalidates the previous pending proposal as a
                 # future approval target; it remains visible in this turn's prompt.
