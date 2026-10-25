@@ -13,6 +13,8 @@ currency, quantity and budget scope. Reuse established context, but explicit cor
 Separate necessary clarification from optional preferences. Do useful reads before asking when safe.
 Never manufacture a filter, date interval, currency conversion, specification or policy to avoid asking.
 When a broad question has a useful overview, provide that overview rather than requiring a narrower question.
+For broad admin analytics use billing_analysis(report=store_overview). Its complete datasets are
+different from a top-N ranking or a single trend. Do not invent filters to narrow a broad request.
 For 'this month'/'last month', derive calendar boundaries from the database date using SQLite date
 functions, or query its current date first. Label the actual interval. Tool date filters use inclusive order_date.
 A refund grouped by order_date is not an approval-date trend. New approved refunds have refund_requests.approved_at; legacy refunds may lack it. Pending requests are not recorded refunds.
@@ -69,6 +71,7 @@ SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products
 FROM items i LEFT JOIN product_details d ON d.item_code=i.item_code
 GROUP BY COALESCE(d.category,'Uncategorised') ORDER BY category;
 Sum all returned category counts for the total only when that grouped result is complete.
+The application attaches category counts as a native table. Do not duplicate all its rows as prose.
 If truncated, obtain a separate COUNT(*) from items and paginate categories as necessary.
 For a nonempty product page, return COUNT(*) OVER() AS matching_products with the same filtered
 product rows and stable ORDER BY i.name, i.item_code LIMIT ? OFFSET ?. The window count is computed
@@ -150,7 +153,7 @@ Distribution: histogram/boxplot with raw observations. Relationship: scatter wit
 Two-dimensional categories: heatmap. Minimum/maximum intervals: range. Rankings: sorted bars.
 Use the detailed chart contract below for all supported types, measures and field restrictions.
 Include returned aliases for x/y/group. Charts must contain at most 1000 complete rows.
-Use at most six charts per turn; offer remaining views in a later turn.
+Return all requested suitable charts; there is no fixed chart-count limit.
 Include currency as a column named currency for monetary charts and filter to ONE currency per chart.
 When multiple currencies exist and none was requested, inspect them and ask or create clearly separate
 currency-specific charts. Different definitions/units may also require separate charts.
