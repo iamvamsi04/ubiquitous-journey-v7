@@ -31,6 +31,36 @@ class Proposal(BaseModel):
     order_id: ProductID | None = None
     promo_code: ProductID | None = None
     summary: str = Field(min_length=1, max_length=1500)
+    arguments: dict | None = None
+
+    @field_validator('arguments')
+    @classmethod
+    def bounded_arguments(cls, values):
+        if values is None:
+            return None
+        if any(not isinstance(key, str) or key in {'order_id','customer_id','action','confirmed'} or
+               key.startswith('execution_') for key in values):
+            raise ValueError('Proposal arguments contain business details only, without scope or approval flags.')
+        pending = [(values, 0)]
+        while pending:
+            value, depth = pending.pop()
+            if depth > 6:
+                raise ValueError('Proposal arguments are too deeply nested.')
+            if isinstance(value, dict):
+                if len(value) > 50 or any(not isinstance(key,str) or not key.strip() or len(key)>100 for key in value):
+                    raise ValueError('Proposal arguments require short field names.')
+                pending.extend((item, depth+1) for item in value.values())
+            elif isinstance(value, list):
+                if len(value) > 100:
+                    raise ValueError('Proposal arguments contain too many records.')
+                pending.extend((item, depth+1) for item in value)
+        try:
+            encoded = json.dumps(values, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except (TypeError, ValueError, OverflowError, UnicodeError):
+            raise ValueError('Proposal arguments require finite JSON values.') from None
+        if len(encoded)>8000:
+            raise ValueError('Proposal arguments are too large.')
+        return values
 
 
 class ShoppingUpdate(BaseModel):
@@ -61,6 +91,21 @@ def empty_state():
             'compared_product_ids': [], 'displayed_product_ids': [], 'selected_product_ids': [],
             'current_draft': None, 'last_order': None, 'pending_confirmation': None,
             'next_question': None, 'product_query': None, 'provided_coupon_codes': []}
+
+
+def shopping_stage(state):
+    return ('confirmation' if state.get('pending_confirmation') else
+        'quote' if state.get('current_draft') else 'after_sale' if state.get('last_order') else
+        'selection' if state.get('selected_product_ids') else
+        'comparison' if state.get('compared_product_ids') else
+        'browse' if state.get('needs') or state.get('known_products') else 'discover')
+
+
+def clear_confirmation(state):
+    result = deepcopy(state)
+    result['pending_confirmation'] = result['next_question'] = None
+    result['stage'] = shopping_stage(result)
+    return result
 
 
 def order_snapshot(order_id, customer_id):
@@ -140,11 +185,7 @@ class ShoppingTracker:
                 self.state['last_order'] = {k:snapshot[k] for k in ('order_id','status','invoice_number')}
 
     def stage(self):
-        self.state['stage'] = ('confirmation' if self.state['pending_confirmation'] else
-            'quote' if self.state['current_draft'] else 'after_sale' if self.state['last_order'] else
-            'selection' if self.state['selected_product_ids'] else
-            'comparison' if self.state['compared_product_ids'] else
-            'browse' if self.state['needs'] or self.state['known_products'] else 'discover')
+        self.state['stage'] = shopping_stage(self.state)
 
     def remember_products(self, ids):
         ids = list(dict.fromkeys(i for i in ids if isinstance(i,str)))[:200]
@@ -316,6 +357,11 @@ class ShoppingTracker:
         saved = deepcopy(self.state)
         try:
             self.apply_update(update, reply)
+            proposal = self.state.get('pending_confirmation')
+            if proposal and proposal.get('arguments'):
+                from agent.action_policy import approval_details
+                details = approval_details(proposal['arguments'])
+                reply += '\n\nDetails for approval:\n' + details
         except (ValidationError, ValueError, TypeError):
             self.state = saved
             self.stage()
