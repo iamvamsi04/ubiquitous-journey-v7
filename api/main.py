@@ -15,6 +15,9 @@ from openai import APIConnectionError, APITimeoutError, APIStatusError
 from config import settings
 from context import context_manager as context
 from context.reply_text import plain_reply
+from context.tables import sanitize_tables
+from context.reports import sanitize_reports
+from context.shopping_state import clear_confirmation
 from database.connection import initialize as initialize_billing
 from database.invoice import invoice_path
 from api import customer_auth
@@ -139,7 +142,8 @@ class CustomerRegistration(CustomerLogin):
 @app.post('/customers/register', status_code=201)
 def register_customer(body: CustomerRegistration):
     try:
-        return customer_auth.register(body.customer_id, body.name, body.password, body.company, body.email)
+        return JSONResponse(customer_auth.register(body.customer_id, body.name, body.password, body.company, body.email),
+                            status_code=201, headers={'Cache-Control': 'no-store'})
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -152,13 +156,21 @@ def login_customer(body: CustomerLogin):
         session = None
     if not session:
         raise HTTPException(401, 'Unable to sign in. Check your credentials or contact store staff.')
-    return session
+    return JSONResponse(session, headers={'Cache-Control': 'no-store'})
 
 
 @app.post('/customers/logout')
 def logout_customer(x_customer_token: str | None = Header(default=None)):
     customer_auth.logout(x_customer_token)
     return {'signed_out': True}
+
+
+@app.get('/customers/session')
+def customer_session(x_customer_token: str | None = Header(default=None)):
+    session = customer_auth.session_for_token(x_customer_token)
+    if not session:
+        raise HTTPException(401, 'Your customer session ended. Please sign in again.', headers={'Cache-Control': 'no-store'})
+    return JSONResponse(session, headers={'Cache-Control': 'no-store'})
 
 
 @app.get("/health")
@@ -203,6 +215,7 @@ async def get_conversation(conversation_id: UUID, x_admin_key: str | None = Head
     messages = context.history(str(conversation_id), include_artifacts=True)
     messages = [{**m, "content": plain_reply(m["content"])} if m["role"] == "assistant" else m for m in messages]
     return {**record, "messages": messages,
+            **({'analytics_context': context.latest_analytics_context(str(conversation_id))} if record['mode'] == 'admin' else {}),
             **({'shopping_state': context.shopping_state(str(conversation_id))} if record['mode'] == 'customer' else {})}
 
 
@@ -249,11 +262,28 @@ async def stream_chat(body: ChatRequest, x_admin_key: str | None = Header(defaul
         headers={'Cache-Control':'no-cache', 'X-Accel-Buffering':'no'})
 
 
+def cached_chat_response(cached):
+    """Apply the same display validation to both completed-request paths."""
+    if 'tables' in cached:
+        cached['tables'] = sanitize_tables(cached['tables'])
+    if 'reports' in cached:
+        cached['reports'] = sanitize_reports(cached['reports'])
+    return {**cached, 'response': plain_reply(cached['response'])}
+
+
 async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x_customer_token=None):
     cid, rid = str(body.conversation_id), str(body.request_id)
     if not body.message.strip():
         raise HTTPException(422, "Message must not be blank.")
     check_record(context.get_conversation(cid), x_admin_key, x_cashier_key, x_customer_token)
+    # A finished response is immutable. Serve an authorized retry immediately
+    # rather than queueing it behind an unrelated customer's model request.
+    try:
+        cached = context.completed_response(cid, rid, body.message)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if cached:
+        return cached_chat_response(cached)
     # One worker and one active turn: no mutable agent state is shared across users.
     queued = perf_counter()
     async with app.state.chat_lock:
@@ -266,8 +296,16 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         if cached:
-            return {**cached, "response": plain_reply(cached["response"])}
+            return cached_chat_response(cached)
+        initial_shopping_state = None
         try:
+            if record['mode'] == 'customer':
+                initial_shopping_state = context.shopping_state(cid)
+                if initial_shopping_state.get('pending_confirmation') or initial_shopping_state.get('next_question'):
+                    # Expire approval before any configuration/model/MCP failure
+                    # can hide this new human turn. Keep its original context for
+                    # evaluating the current reply, never a future unrelated yes.
+                    context.checkpoint_shopping(cid,rid,clear_confirmation(initial_shopping_state),record['customer_id'])
             validate = getattr(app.state.engine, "validate_configuration", None)
             if validate:
                 validate()
@@ -280,12 +318,20 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x
             kwargs = {'mode': record['mode']} if record['mode'] in ('admin', 'cashier') else {}
             if chart_callback is not None and record['mode'] == 'admin':
                 kwargs['chart_callback'] = chart_callback
+            if record['mode'] == 'admin' and getattr(app.state.engine, 'supports_analytics_context', False):
+                kwargs['analytics_context'] = context.latest_analytics_context(cid)
+            if record['mode'] in ('admin','cashier') and getattr(app.state.engine, 'supports_action_context', False):
+                kwargs['action_context'] = context.latest_action_context(cid,rid)
             if record['mode'] == 'customer':
-                kwargs.update(shopping_state=context.shopping_state(cid),
+                kwargs.update(shopping_state=initial_shopping_state,
                     state_callback=lambda state, owner: context.checkpoint_shopping(cid, rid, state, owner))
             result = await asyncio.wait_for(app.state.engine.chat(body.message, context.history(cid), record["customer_id"], **kwargs),
                                             timeout=settings.CHAT_TIMEOUT)
             result["response"] = plain_reply(result["response"])
+            if 'tables' in result:
+                result['tables'] = sanitize_tables(result['tables'])
+            if 'reports' in result:
+                result['reports'] = sanitize_reports(result['reports'])
             associated = result.pop('associated_customer_id', None)
             if associated and record['mode'] == 'customer' and associated != record['customer_id']:
                 raise ValueError('Customer association requires verified sign-in in a new conversation.')
