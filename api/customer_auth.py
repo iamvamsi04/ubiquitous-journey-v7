@@ -13,7 +13,7 @@ from database.connection import connect, transaction
 ITERATIONS = 600000
 SESSION_SECONDS = 12 * 60 * 60
 LOGIN_ATTEMPTS = 5
-LOCK_SECONDS = 15 * 60
+LOCK_SECONDS = 3 * 60
 
 
 def validate_password(password):
@@ -45,7 +45,8 @@ def new_session(conn, customer_id):
     conn.execute('DELETE FROM customer_sessions WHERE expires_at<=?', (now,))
     conn.execute('INSERT INTO customer_sessions(token_hash,customer_id,expires_at) VALUES (?,?,?)',
                  (hashlib.sha256(token.encode()).hexdigest(), customer_id, now + SESSION_SECONDS))
-    return {'customer_id': customer_id, 'token': token, 'expires_in': SESSION_SECONDS}
+    return {'customer_id': customer_id, 'token': token, 'expires_at': now + SESSION_SECONDS,
+            'expires_in': SESSION_SECONDS}
 
 
 def register(customer_id, name, password, company=None, email=None):
@@ -102,14 +103,25 @@ def login(customer_id, password):
         return new_session(conn, customer_id)
 
 
-def customer_for_token(token):
+def session_for_token(token):
+    """The browser sends its original token; the stored digest is never a credential."""
     if not isinstance(token, str) or not 40 <= len(token) <= 128:
         return None
     digest = hashlib.sha256(token.encode()).hexdigest()
+    now = int(time.time())
     with closing(connect(readonly=True)) as conn:
-        record = conn.execute('SELECT customer_id FROM customer_sessions WHERE token_hash=? AND expires_at>?',
-                              (digest, int(time.time()))).fetchone()
-        return record[0] if record else None
+        record = conn.execute("SELECT customer_id,expires_at FROM customer_sessions WHERE token_hash=? "
+                              "AND typeof(expires_at)='integer' AND expires_at>?",
+                              (digest, now)).fetchone()
+        if record:
+            return {'customer_id': record['customer_id'], 'expires_at': record['expires_at'],
+                    'expires_in': record['expires_at'] - now}
+        return None
+
+
+def customer_for_token(token):
+    session = session_for_token(token)
+    return session['customer_id'] if session else None
 
 
 def logout(token):
