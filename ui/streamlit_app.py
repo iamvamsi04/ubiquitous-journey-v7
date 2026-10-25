@@ -9,6 +9,8 @@ import httpx
 import streamlit as st
 from config import settings
 from context.reply_text import plain_reply, error_reply
+from ui.tables import render_tables
+from ui.reports import render_reports
 
 st.set_page_config(
     page_title="Billing Agent",
@@ -37,6 +39,8 @@ def request_headers():
 
 
 def request(method, route, **kwargs):
+    if st.session_state.get('mode') == 'Customer' and st.session_state.get('customer_token'):
+        validate_customer_session()
     result = api_client().request(method, API + route, headers=request_headers(), **kwargs)
     result.raise_for_status()
     return result
@@ -98,6 +102,9 @@ def clear_customer_session():
     for key in ('customer_token', 'customer_id', 'customer_password', 'customer_password_repeat',
                 'customer_login_id', 'customer_name', 'customer_company', 'customer_email'):
         st.session_state[key] = ''
+    for key in ('_customer_session_checked', '_customer_session_deadline',
+                '_customer_session_retry_after', '_customer_session_warning'):
+        st.session_state.pop(key, None)
 
 
 def reset_mode():
@@ -119,9 +126,57 @@ def reset_mode():
 def handle_expired_session(exc):
     if (st.session_state.mode == 'Customer' and st.session_state.customer_token
             and isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401):
+        try:
+            if exc.response.json().get('detail') == 'Invalid API key.':
+                return  # A server configuration error does not revoke the customer's identity.
+        except (ValueError, AttributeError):
+            pass
         clear_customer_session()
         st.session_state.account_error = 'Your session ended. Please sign in again.'
         st.rerun()
+
+
+def remember_customer_session(account):
+    now = monotonic()
+    st.session_state['_customer_session_checked'] = (API, st.session_state.customer_token, now)
+    remaining = account.get('expires_in')
+    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and remaining > 0:
+        st.session_state['_customer_session_deadline'] = now + remaining
+    else:
+        st.session_state.pop('_customer_session_deadline', None)
+    st.session_state.pop('_customer_session_retry_after', None)
+    st.session_state.pop('_customer_session_warning', None)
+
+
+def validate_customer_session():
+    """Keep the screen's identity in sync with the API without adding a call to every rerun."""
+    now = monotonic()
+    deadline = st.session_state.get('_customer_session_deadline')
+    if deadline is not None and now >= deadline:
+        clear_customer_session()
+        st.session_state.account_error = 'Your session ended. Please sign in again.'
+        st.rerun()
+    checked = st.session_state.get('_customer_session_checked')
+    if checked and checked[:2] == (API, st.session_state.customer_token) and now - checked[2] < 15:
+        return
+    if now < st.session_state.get('_customer_session_retry_after', 0):
+        return
+    try:
+        result = api_client().get(API + '/customers/session', headers=request_headers(), timeout=2.0)
+        result.raise_for_status()
+        session = result.json()
+        if session.get('customer_id') != st.session_state.customer_id:
+            clear_customer_session()
+            st.session_state.account_error = 'Your session ended. Please sign in again.'
+            st.rerun()
+        remember_customer_session(session)
+    except httpx.HTTPError as exc:
+        handle_expired_session(exc)
+        st.session_state['_customer_session_retry_after'] = now + 3
+        st.session_state['_customer_session_warning'] = 'Unable to check your session. Check the API connection.'
+    except (ValueError, AttributeError):
+        st.session_state['_customer_session_retry_after'] = now + 3
+        st.session_state['_customer_session_warning'] = 'Unable to check your session. Check the API connection.'
 
 
 def logout():
@@ -146,6 +201,7 @@ def customer_account(action):
         account = response.json()
         st.session_state.customer_token = account['token']
         st.session_state.customer_id = account['customer_id']
+        remember_customer_session(account)
         st.session_state.conversation_id = None
         st.session_state.messages = []
         st.session_state.pending = None
@@ -198,8 +254,11 @@ with st.sidebar:
     else:
         st.caption('Shopping and billing help')
         if st.session_state.customer_token:
+            validate_customer_session()
             st.caption('Signed in as ' + st.session_state.customer_id)
             st.button('Sign out', on_click=reset_mode)
+            if st.session_state.get('_customer_session_warning'):
+                st.warning(st.session_state['_customer_session_warning'])
         else:
             st.caption('Browse without signing in. Sign in for your orders, invoices and refunds.')
             with st.expander('Customer account'):
@@ -284,6 +343,9 @@ for i, entry in enumerate(st.session_state.messages):
             from ui.charts import render_chart
             for chart in entry.get('charts', []):
                 render_chart(chart)
+        if entry['role'] == 'assistant':
+            render_tables(entry.get('tables', []))
+            render_reports(entry.get('reports', []), i)
         show_invoices(entry, i)
 
 prompt = st.chat_input("Ask a billing question...", disabled=bool(st.session_state.pending))
@@ -308,7 +370,8 @@ if st.session_state.pending:
                 else:
                     reply = request("POST", "/chat", json=st.session_state.pending).json()
         st.session_state.messages.append({"role": "assistant", "content": reply["response"],
-            "invoices": reply.get("invoices", []), 'charts':reply.get('charts',[])})
+            "invoices": reply.get("invoices", []), 'charts':reply.get('charts',[]),
+            'tables':reply.get('tables',[]), 'reports':reply.get('reports',[])})
         st.session_state.pending = None
         st.rerun()
     except httpx.HTTPError as exc:
