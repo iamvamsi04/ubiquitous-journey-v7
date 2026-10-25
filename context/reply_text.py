@@ -21,7 +21,10 @@ before or after the JSON object. Do not output plain text and then a second {"re
 The no-JSON writing rule applies inside reply, not to the required internal transport envelope.
 ADMIN MODE: return ONE plain-English answer with no reply/shopping_update JSON wrapper.
 Internal tool-call arguments follow their own structured schemas in either mode.
-Charts and invoice PDFs are separate UI attachments, not invented URLs in the text.
+Tables, charts, complete analytics datasets and invoice PDFs are separate UI attachments.
+The application builds tables directly from executed tool rows. Do not duplicate them as prose,
+invent a table/attachment, or explain how to do the requested work instead of doing it.
+For current business facts retrieve fresh evidence before answering; conceptual questions may be explained.
 """
 
 FALLBACK = 'I could not display that answer clearly. Please ask me to check the current records before repeating an order or refund request.'
@@ -127,3 +130,117 @@ def error_reply(response):
     except (ValueError, AttributeError):
         pass
     return 'The request could not be completed. Check your connection and request details, then try again.'
+
+
+def _markdown_cells(line):
+    """Read literal Markdown cells; an escaped pipe stays in its own cell."""
+    value = line.strip()
+    cells, cell, escaped = [], [], False
+    separators = 0
+    for char in value:
+        if char == '|' and not escaped:
+            cells.append(''.join(cell).strip())
+            cell = []
+            separators += 1
+        elif char == '|' and escaped:
+            cell.pop()  # The single escape before this pipe is presentation syntax.
+            cell.append(char)
+        else:
+            cell.append(char)
+        escaped = not escaped if char == '\\' else False
+    cells.append(''.join(cell).strip())
+    if not separators:
+        return None
+    if value.startswith('|'):
+        cells.pop(0)
+    # A final escaped pipe belongs to the last cell, not the table border.
+    trailing_slashes = len(value[:-1]) - len(value[:-1].rstrip('\\')) if value.endswith('|') else 0
+    if value.endswith('|') and trailing_slashes % 2 == 0:
+        cells.pop()
+    return cells
+
+
+def _explanation_table_title(lines, index):
+    for line in reversed(lines[:index]):
+        if not line.strip():
+            continue
+        candidate = re.sub(r'^\s*#{1,6}\s+', '', line).strip()
+        candidate = re.sub(r'^(\*\*|__)(.+)\1$', r'\2', candidate).rstrip(':').strip()
+        if (candidate and len(candidate) <= 120 and len(candidate.split()) <= 16
+                and '|' not in candidate and not candidate.endswith(('.', '?', '!'))):
+            return candidate
+        break
+    return 'Explanation'
+
+
+def split_reply_tables(content):
+    """Extract bounded explanation tables, retaining the normal reply transport.
+
+    The caller must restrict this to general explanations without successful
+    business-tool receipts. Current business facts require verified tool tables.
+    Malformed or over-limit tables remain untouched for ``plain_reply`` to handle.
+    This function does not interpret numbers, evaluate cells or change memory.
+    """
+    from context.tables import MAX_TABLES, MAX_TOTAL_BYTES, table_artifact
+
+    if not isinstance(content, str):
+        return content, []
+    envelope = reply_envelope(content)
+    visible = envelope.get('reply', envelope.get('response')) if envelope is not None else content
+    if not isinstance(visible, str):
+        return content, []
+    lines = visible.splitlines()
+    kept, tables, total_bytes, index, fence = [], [], 0, 0, None
+    while index < len(lines):
+        line = lines[index]
+        marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+        if marker:
+            token = marker[1]
+            if fence is None:
+                fence = (token[0], len(token))
+            elif token[0] == fence[0] and len(token) >= fence[1]:
+                fence = None
+            kept.append(line)
+            index += 1
+            continue
+        headers = _markdown_cells(line) if fence is None else None
+        separator = _markdown_cells(lines[index + 1]) if headers and index + 1 < len(lines) else None
+        if not (headers and separator and len(headers) == len(separator)
+                and all(re.fullmatch(r':?-{3,}:?', cell) for cell in separator)):
+            kept.append(line)
+            index += 1
+            continue
+        end, rows, malformed = index + 2, [], False
+        while end < len(lines):
+            row = _markdown_cells(lines[end])
+            if row is None or re.match(r'^\s*(`{3,}|~{3,})', lines[end]):
+                break
+            if len(row) != len(headers) or all(re.fullmatch(r':?-{3,}:?', cell) for cell in row):
+                malformed = True
+            rows.append(row)
+            end += 1
+        if not malformed and len(tables) < MAX_TABLES:
+            try:
+                table = table_artifact(_explanation_table_title(lines, index), headers, rows,
+                                       coverage='General explanation.')
+                size = len(json.dumps(table, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+                if total_bytes + size > MAX_TOTAL_BYTES:
+                    raise ValueError('Explanation tables exceed the safe attachment size.')
+            except (ValueError, TypeError, OverflowError):
+                pass
+            else:
+                tables.append(table)
+                total_bytes += size
+                index = end
+                continue
+        kept.extend(lines[index:end])
+        index = end
+    if not tables:
+        return content, []
+    cleaned = re.sub(r'\n{3,}', '\n\n', '\n'.join(kept)).strip()
+    cleaned = cleaned or 'The explanation is shown in the table.'
+    if envelope is None:
+        return cleaned, tables
+    updated = dict(envelope)
+    updated['reply' if 'reply' in updated else 'response'] = cleaned
+    return json.dumps(updated, ensure_ascii=False), tables
