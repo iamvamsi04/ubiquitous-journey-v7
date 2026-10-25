@@ -151,9 +151,19 @@ def costing(orders, lines, items):
 def billing_analysis(customer_id: str | None = None, order_id: str | None = None,
                      date_from: str | None = None, date_to: str | None = None,
                      top_n: int = 10, trend_period: str | None = None,
-                     trend_metric: str = 'order_total', chart_type: str = 'line', report: str | None = None) -> dict:
+                     trend_metric: str = 'order_total', chart_type: str = 'line', report: str | None = None,
+                     chart_mode: str = 'overview') -> dict:
     """Analyze invoices and break down revenue, discounts, tax, shipping, ledger refunds and estimated costs.
 
+    report=store_overview returns COMPLETE store-wide summary, monthly trends,
+    category/product/customer breakdowns, inventory, raw invoice observations,
+    refunds and local credit activity as named tabular datasets, without top-N
+    sampling. Use it for broad store analytics or an overall store dashboard.
+    For store_overview, chart_mode=overview gives the two headline charts;
+    dashboard gives a varied visual dashboard; all gives every meaningful supported
+    chart family with explicit omissions when its required data is unavailable;
+    none returns datasets without charts. All charts use actual complete datasets,
+    separate currencies and never use a constant currency as an axis.
     report=pending_refunds/pending_above_threshold lists requests; refund_reconciliation compares local approvals with refunds/credits on approval dates. Never bank settlements.
     Optional filters intersect; dates are inclusive order dates (YYYY-MM-DD).
     Drafts are counted but excluded from financial totals. Costs use CURRENT item
@@ -161,11 +171,19 @@ def billing_analysis(customer_id: str | None = None, order_id: str | None = None
     Use for billing analytics or cost breakdown questions; never modifies records.
     For a revenue/order-total trend CHART set trend_period to day, week, month, quarter or year.
     trend_metric: order_total (charged_price, without subtracting refunds), net_billed (after refunds),
-    refunds, subtotal, discount, tax or shipping. chart_type: line or bar.
+    refunds, subtotal, discount, tax or shipping. chart_type: line, bar, grouped_bar
+    or horizontal_bar. Other families need their appropriate query data.
     Prefer this validated report for invoice trends: it groups each invoice once, normalizes currency,
     separates currencies and returns chart artifacts. Existing date/customer/order filters apply.
     """
+    if chart_mode not in ('overview', 'dashboard', 'all', 'none'):
+        raise ValueError('chart_mode must be overview, dashboard, all or none.')
+    if chart_mode != 'overview' and report != 'store_overview':
+        raise ValueError('chart_mode applies only to report=store_overview.')
     if report is not None:
+        if report == 'store_overview':
+            from mcp_server.reporting import store_overview
+            return store_overview(customer_id, order_id, date_from, date_to, chart_mode)
         if report not in ('pending_refunds','pending_above_threshold','refund_reconciliation'): raise ValueError('Unknown local refund report.')
         from mcp_server.tools.service_workflows import refund_report
         return refund_report(report,date_from,date_to,customer_id,order_id)
@@ -215,8 +233,8 @@ def invoice_trend(customer_id, order_id, date_from, date_to, period, metric, cha
         raise ValueError('Choose day/week/month/quarter/year and a supported invoice trend metric.')
     from mcp_server.charts import canonical_chart_type
     chart_type = canonical_chart_type(chart_type)
-    if chart_type not in ('line','bar'):
-        raise ValueError('Invoice trends support line or bar charts.')
+    if chart_type not in ('line','bar','grouped_bar','horizontal_bar'):
+        raise ValueError('Invoice trends support line, bar, grouped_bar or horizontal_bar charts.')
     where, args = filters(customer_id, order_id, date_from, date_to)
     conn = connect(readonly=True)
     try:
@@ -230,6 +248,8 @@ def invoice_trend(customer_id, order_id, date_from, date_to, period, metric, cha
         raise ValueError('Too many invoices for a complete trend. Narrow the date/customer scope.')
     buckets = defaultdict(lambda: defaultdict(lambda: ZERO))
     for row in records:
+        if not str(row['order_invoice'] or '').strip():
+            raise ValueError('A placed order has no invoice number. Correct it before charting invoice trends.')
         currency = row['report_currency']
         if not currency or len(currency)!=3 or not currency.isascii() or not currency.isalpha():
             raise ValueError('An invoice has missing or invalid currency. Correct the record before charting.')
@@ -241,8 +261,6 @@ def invoice_trend(customer_id, order_id, date_from, date_to, period, metric, cha
         amount = dec(row[fields[metric]])
         if metric=='net_billed': amount -= dec(row['refund_amount'])
         buckets[currency][day.isoformat()] += amount
-    if len(buckets)>6:
-        raise ValueError('More than six currencies match. Narrow the scope before requesting charts.')
     from mcp_server.charts import prepare_chart
     reports=[]
     for currency, values in sorted(buckets.items()):
