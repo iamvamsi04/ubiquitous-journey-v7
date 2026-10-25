@@ -135,13 +135,15 @@ def execute_sql_query(query: str | None = None, chart: dict | None = None, param
     Invoice totals minus recorded refunds are not amounts due or proof of settlement.
     Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
     For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
-    Types: bar,stacked_bar,normalized_bar,line,
-    pie,scatter,histogram,boxplot,heatmap,range. x/y and optional group must be returned column aliases.
+    Types: bar,grouped_bar,horizontal_bar,stacked_bar,normalized_bar,line,pie,
+    scatter,bubble,histogram,boxplot,heatmap,range,combo,timeline.
+    x/y and optional group, bubble size or timeline end must be returned column aliases.
     Histogram: numeric x,y:[],bins 2-50. Heatmap: x,group,y:[measure]. Range: y:[low,high].
     Other types accept the column counts in the chart contract. Optional x_type: categorical,numeric,temporal.
     Standard bars/lines also accept group with one y, returning one row per x/group pair.
     Distributions use complete observations; summaries aggregate duplicate coordinates in SQL.
-    Include a currency column for money and query ONE currency per chart. Order trends chronologically.
+    Include a currency column for money and query ONE currency per chart; currency is metadata,
+    never an axis or a constant USD series. Order trends chronologically. No chart-count cap.
     Chart queries allow up to 1000 rows; ordinary reads use SQL_MAX_ROWS. No charts from truncated results. A chart_error leaves query rows usable; correct SQL/spec if needed.
     """
     if not isinstance(query, str) or not query.strip() or len(query) > 20000:
