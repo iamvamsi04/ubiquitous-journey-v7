@@ -35,22 +35,26 @@ def ensure_customer(conn, customer_id):
 
 
 @tool_result
-def manage_customer(customer_id: str, name: str, company: str = '', email: str = '',
+def manage_customer(customer_id: str, name: str, company: str | None = None, email: str | None = None,
                     action: str = 'create', confirmed: bool = False, billing_address: str | None = None,
                     tax_registration_number: str | None = None) -> dict:
-    """Create or update a customer after confirmation. Update replaces all contact fields; show them first.
+    """Create or update a customer after confirmation. Show the proposed contact changes first.
+
+    Updates preserve omitted company/email fields. Explicit empty strings clear those fields.
 
     Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
     """
     confirm(confirmed)
     identifier(customer_id, 'customer ID')
     name = text(name, 'Name', 200)
-    if not isinstance(company, str) or len(company) > 200:
+    if company is not None and (not isinstance(company, str) or len(company) > 200):
         raise BillingError('Company must contain at most 200 characters.')
-    if not isinstance(email, str) or len(email) > 200 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)):
+    if email is not None and (not isinstance(email, str) or len(email) > 200 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email))):
         raise BillingError('Provide a valid email address or leave it empty.')
     with transaction() as conn:
         existing = conn.execute('SELECT * FROM customers WHERE customer_id=?', (customer_id,)).fetchone()
+        company = (existing['company'] or '') if company is None and action == 'update' and existing else (company or '')
+        email = (existing['email'] or '') if email is None and action == 'update' and existing else (email or '')
         if action == 'create':
             if existing:
                 from mcp_server.access import scope
