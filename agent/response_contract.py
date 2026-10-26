@@ -1,12 +1,12 @@
-"""Current-turn retrieval requirements and verified report presentation.
+"""Validate and present executed report results without classifying user wording.
 
-The contract selects evidence and output shape. It never invents business facts,
-executes a mutation or treats a prior conversation answer as a fresh read.
+The model chooses the relevant tools and presentation from the conversation.
+These helpers operate only on structured tool arguments and verified results;
+they never turn a word in the user's message into a tool call or dashboard.
 """
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone, date
+from datetime import date
 import re
-import unicodedata
 
 
 READ_TOOLS = frozenset({'execute_sql_query', 'billing_analysis', 'billing_anomalies',
@@ -19,13 +19,9 @@ INVENTORY_QUERY = (f'SELECT {CATEGORY_EXPRESSION} AS category, COUNT(*) AS produ
     f'GROUP BY {CATEGORY_EXPRESSION} ORDER BY category')
 
 
-def words(text):
-    text = unicodedata.normalize('NFKC', str(text)).casefold()
-    return re.sub(r'\s+', ' ', re.sub(r'[^\w?]+', ' ', text).replace('_', ' ')).strip()
-
-
 @dataclass(frozen=True)
 class ResponseContract:
+    """The shape of an executed result, not an interpretation of a question."""
     kind: str = 'conversation'
     scoped: bool = False
     domains: frozenset[str] = frozenset()
@@ -49,416 +45,78 @@ class ResponseContract:
         return {key: dict(self.filter_items).get(key) for key in FILTER_KEYS}
 
     def prompt(self):
-        if self.kind == 'inventory_overview':
-            return ('\nCURRENT REQUEST CONTRACT: complete product-range overview. Execute '
-                'execute_sql_query with this complete read, without extra filters, joins or limits: '
-                + INVENTORY_QUERY + '. The application displays all categories as a table and '
-                'computes the summary from these rows; no prose formatting call is needed.\n')
-        if self.kind == 'store_overview':
-            filters = ', '.join(f'{key}={value!r}' for key, value in self.expected_filters.items())
-            presentation = f", chart_mode={self.chart_mode!r}" if self.chart_mode != 'overview' else ''
-            return ('\nCURRENT REQUEST CONTRACT: comprehensive store analytics. Call '
-                "billing_analysis(report='store_overview', " + filters + presentation + '). '
-                'These are the exact requested filters; preserve them and add none. Do not replace '
-                'the report with a trend, top ten or one metric. The application displays verified '
-                'summary tables, charts and complete report datasets; no prose formatting call is needed.\n')
-        if self.needs_evidence:
-            return ('\nCURRENT REQUEST CONTRACT: retrieve current business data, not an explanation '
-                'of how to retrieve it. Use current-turn read tools covering '
-                + (', '.join(sorted(self.domains)) or 'the requested records') + '. '
-                'Successful results may be empty; schema inspection or an unrelated read is not an answer. '
-                'Preserve every explicit filter and do not invent a filter. Tables are attached from '
-                'tool rows automatically; explain findings briefly without repeating every table row.\n')
+        # Retained for callers using older policy builders. An observed report
+        # must never become instructions to execute a different request.
         return ''
 
 
-def _today():
-    return datetime.now(timezone.utc).date()
-
-
-def _period_bounds(period, previous):
-    today = _today()
-    if period == 'week':
-        first = today - timedelta(days=today.weekday() + 7*int(previous))
-        return first, first + timedelta(days=6)
-    if period == 'month':
-        first = today.replace(day=1)
-        if previous:
-            first = (first - timedelta(days=1)).replace(day=1)
-        after = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
-        return first, after - timedelta(days=1)
-    if period == 'quarter':
-        first = today.replace(month=(today.month-1)//3*3+1, day=1)
-        if previous:
-            prior = first - timedelta(days=1)
-            first = prior.replace(month=(prior.month-1)//3*3+1, day=1)
-        month = first.month + 3
-        after = date(first.year + int(month > 12), (month-1) % 12 + 1, 1)
-        return first, after - timedelta(days=1)
-    year = today.year - int(previous)
-    return date(year, 1, 1), date(year, 12, 31)
-
-
-def _report_filters(message):
-    """Resolve explicit supported scopes; unknown names/references need flexible reads."""
-    remaining, selected, ambiguous = str(message), {}, False
-    for key, label in (('customer_id', 'customer'), ('order_id', 'order')):
-        pattern = re.compile(r'\b' + label + r'(?:[ _]+id)?\s*(?:[:=#]\s*)?\s+([A-Za-z0-9_-]{1,50})\b', re.I)
-        matches = list(pattern.finditer(remaining))
-        ids = [m[1] for m in matches if re.search(r'\bid\b|_id\b', m[0], re.I)
-               or re.search(r'\d|[_-]', m[1])]
-        if len(ids) > 1:
-            ambiguous = True
-        elif ids:
-            selected[key] = ids[0]
-            for match in reversed(matches):
-                if match[1] == ids[0]:
-                    remaining = remaining[:match.start()] + ' ' + remaining[match.end():]
-    iso = r'(\d{4}-\d{2}-\d{2})'
-    ranges = [
-        (rf'\b(?:from|between)\s+{iso}\s+(?:to|and|through|until)\s+{iso}', ('date_from','date_to')),
-        (rf'\b(?:since|from|date_from\s*[:=]?)\s+{iso}', ('date_from',)),
-        (rf'\b(?:through|until|date_to\s*[:=]?)\s+{iso}', ('date_to',)),
-        (rf'\b(?:on|for)\s+{iso}', ('date_from','date_to')),
-    ]
-    for pattern, keys in ranges:
-        for match in list(re.finditer(pattern, remaining, re.I))[::-1]:
-            try:
-                values = [date.fromisoformat(value).isoformat() for value in match.groups()]
-            except ValueError:
-                ambiguous = True
-                continue
-            if len(values) == 1 and len(keys) == 2:
-                values *= 2
-            for key, value in zip(keys, values):
-                if key in selected and selected[key] != value:
-                    ambiguous = True
-                selected[key] = value
-            remaining = remaining[:match.start()] + ' ' + remaining[match.end():]
-    relative = list(re.finditer(r'\b(?:(today|yesterday)|(?:(this|last|previous)\s+(week|month|quarter|year))|last\s+(\d+)\s+days?)\b', remaining, re.I))
-    if len(relative) > 1 or (relative and any(key in selected for key in ('date_from','date_to'))):
-        ambiguous = True
-    elif relative:
-        match = relative[0]
-        if match[1]:
-            start = end = _today() - timedelta(days=int(match[1].casefold() == 'yesterday'))
-        elif match[4]:
-            count = int(match[4])
-            if not 1 <= count <= 36600:
-                return (), True
-            start, end = _today() - timedelta(days=count-1), _today()
-        else:
-            start, end = _period_bounds(match[3].casefold(), match[2].casefold() != 'this')
-        selected.update(date_from=start.isoformat(), date_to=end.isoformat())
-        remaining = remaining[:match.start()] + ' ' + remaining[match.end():]
-    if selected.get('date_from', '') > selected.get('date_to', '9999-12-31'):
-        ambiguous = True
-    text = words(remaining)
-    text = re.sub(r'\b(?:order totals?|customer summaries|for (?:the )?(?:whole |entire )?store)\b', '', text)
-    text = re.sub(r'\bfor(?=\s*(?:$|and\b))', '', text)
-    unresolved = re.search(r'\b(?:for|from|since|between|customer|order|today|yesterday|last|previous|weeks?|months?|quarters?|years?|'
-        r'january|february|march|april|may|june|july|august|september|october|november|december|'
-        r'currency|usd|eur|gbp|inr|category|product|brand|except|exclude|excluding|without|omit|omitting|only|not|'
-        r'pending|overdue|cheapest|expensive|bought|purchased|email|addresses?|phone|contact|'
-        r'waiting|awaiting|status|cancelled|drafts?|placed|issued|fulfilled|delivered|shipped|backorders?)\b|\d', text)
-    return tuple((key, selected[key]) for key in FILTER_KEYS if key in selected), bool(ambiguous or unresolved)
-
-
-def _abstract_comparison(text):
-    if not re.search(r'\b(?:compare|comparison|difference|differences|versus|vs)\b',text):
-        return False
-    topics = {}
-    patterns = {'draft':r'drafts?(?: orders?)?', 'placed':r'placed orders?',
-        'invoice':r'invoices?', 'refund':r'refunds?(?: requests?| approvals?)?',
-        'credit':r'store credit', 'percent':r'percent(?:age)?(?: discounts?)?',
-        'flat':r'flat discounts?', 'cancellation':r'order cancellation',
-        'customer':r'customer(?: modes?)?', 'cashier':r'cashier(?: modes?)?', 'admin':r'admin(?: modes?)?'}
-    remaining = text
-    for key,pattern in patterns.items():
-        if re.search(r'\b(?:'+pattern+r')\b',remaining):
-            topics[key] = True
-            remaining = re.sub(r'\b(?:'+pattern+r')\b',' ',remaining)
-    remaining = re.sub(r'\b(?:explain|describe|please|what|is|are|the|a|an|between|and|or|versus|vs|compare|comparison|difference|differences|in|as|table|tabular|form|their|permissions|roles|modes|responsibilities|access)\b',' ',remaining)
-    if remaining.strip(' ?'):
-        return False
-    kinds = set(topics)
-    if kinds <= {'customer','cashier','admin'}:
-        return len(kinds)>=2 and bool(re.search(r'\b(?:permissions|roles|modes|responsibilities|access)\b',text))
-    pairs = ({'draft','placed'},{'draft','invoice'},{'refund','credit'},
-             {'percent','flat'},{'cancellation','refund'})
-    return any(pair <= kinds for pair in pairs)
-
-
-def _conceptual(text):
-    if _abstract_comparison(text):
-        return True
-    if re.search(r'\b(?:chart|graph|plot) types\b|\btypes of (?:charts|graphs|plots)\b', text) and not re.search(
-            r'\b(?:current|actual|our|store|this|these|those|matching) data\b|\bgenerate|draw|render\b', text):
-        return True
-    policy = re.search(r'\b(?:return window|return policy|refund policy|coupon policy|'
-                       r'approval threshold|cashier limit|cashier refund limit|refund limit)\b', text)
-    records = re.search(r'\b(?:my|this|that|these|those) (?:orders?|invoices?|refunds?|purchases?)\b|'
-                        r'\b(?:show|list|find|which|check)\b.*\b(?:orders?|invoices?|requests?)\b|'
-                        r'\b(?:order|invoice|customer) (?:id |number )?[a-z_]*\d|\d{4} \d{2} \d{2}', text)
-    if policy and not records:
-        # These configured rules are already trusted per-turn system context.
-        # Do not force an unrelated database read just to explain a policy.
-        return True
-    if re.search(r'\b(?:how to|how do i|how can i|how does|what does .+ mean)\b', text):
-        return True
-    if re.search(r'\b(?:examples?|hypothetical|sql query|prompt|source code|setup steps|implementation|table schema)\b', text):
-        return True
-    abstract = (r'(?:store wide analytics|storewide analytics|analytics|billing analysis(?: tool)?|'
-        r'billing anomalies(?: tool)?|billing agent|a draft|an invoice|a coupon|a promotion|'
-        r'order status|return window|refund policy|return policy|password hashes?|failed attempts|locked until)')
-    if re.fullmatch(r'(?:what (?:is|are|does)|explain|describe|define) (?:the )?' + abstract + r'(?: work| do| mean| for)?\??', text):
-        return True
-    live = re.search(r'\b(?:my|our|current|today|yesterday|this|last|total|totals|status)\b|\d', text)
-    if not live:
-        if re.search(r'\b(?:examples?|definitions?|checklist|best practices|useful questions|shopping tips|steps to|steps for)\b',text):
-            return True
-        concepts = set(re.findall(r'\b(?:drafts?|placed orders?|invoices?|refund requests?|refund approvals?|percent discounts?|flat discounts?|store credit)\b',text))
-        roles = set(re.findall(r'\b(?:customer|cashier|admin)\b',text))
-        if (len(concepts)>=2 and re.search(r'\b(?:difference|differences|definitions?|meanings?)\b',text)
-                or len(roles)>=2 and re.search(r'\b(?:permissions|roles|modes|responsibilities|access)\b',text)):
-            return True
-    if re.match(r'^(?:explain|describe|define|why)\b', text) and not live:
-        return True
-    return bool(re.search(r'\b(?:refund|return) policy\b', text) and not live)
-
-
-def _domains(text):
-    domains = set()
-    if re.search(r'\b(?:products?|items?|categories|stock|inventory|prices?|cheaper|alternatives|features?|specifications?|sku)\b', text):
-        domains.add('products')
-    if re.search(r'\b(?:orders?|drafts?|fulfillment|delivery|shipment)\b', text):
-        domains.add('orders')
-    if re.search(r'\b(?:invoices?|billed)\b', text):
-        domains.add('invoices')
-    if re.search(r'\b(?:refunds?|returns?)\b', text):
-        domains.add('refunds')
-    if 'refunds' in domains and re.search(r'\b(?:requests?|pending|awaiting)\b', text):
-        domains.add('refund_requests')
-    if re.search(r'\b(?:sales|revenue|costs?|spending|discounts?|tax|shipping|margin|profit|analytics)\b', text):
-        domains.add('finance')
-    product_cost = (re.search(r'\b(?:item\d+|sku\d+)\b', text)
-        or re.search(r'\bwhat (?:does|do) .+ costs?\b', text))
-    if product_cost and not domains & {'orders', 'invoices'} and not re.search(r'\b(?:sales|revenue|spending|tax|shipping|margin|profit|analytics)\b', text):
-        domains.add('products')
-        domains.discard('finance')
-    if re.search(r'\bcredit\b', text):
-        domains.add('credit')
-    if re.search(r'\b(?:anomalies|inconsistencies|discrepancies)\b', text):
-        domains.add('anomalies')
-    customer_records = re.search(
-        r'\b(?:customers?\s+(?:records?|accounts?|list|directory)|'
-        r'(?:list|directory)\s+(?:of\s+)?(?:all\s+)?customers)\b', text)
-    if customer_records or re.search(r'\b(?:customers?|account|email|contact)\b', text) and (
-            not domains or re.search(r'\b(?:email|contact|details|addresses|profiles|names)\b', text)):
-        domains.add('customers')
-    return frozenset(domains)
-
-
-def _named_chart_style(text):
-    # Retired styles remain recognizable requests, so they cannot turn into an
-    # unrelated dashboard. Availability comes from the chart contract.
-    return re.search(r'\b(?:bar|pie|donut|scatter|histogram|boxplot|box plot|heatmap|heat map|'
-        r'waterfall|water fall|candlestick|candle stick|pareto|funnel|treemap|tree map|timeline|'
-        r'bubble|area|combo|combination|step line|range chart|range plot|line chart|line plot)\b|'
-        r'\b(?:as|using) (?:a |an )?(?:line|range)\b|'
-        r'\b(?:in|into) (?:a|an) (?:line|range)\b', text)
-
-
-def chart_intent(message):
-    """Presentation intent, separate from business measure and access scope."""
-    text = words(message)
-    if not re.search(r'\b(?:charts?|graphs?|plots?|visuals?|visually|graphical|graphically|visualizations?|visualisations?|'
-                     r'visualize|visualise|pictorial|dashboard)\b|\bdraw\b.*\b(?:it|that|them|those|results)\b', text):
-        return None
-    all_types = re.search(r'\b(?:all|every|each)\s+(?:(?:\d+|the|possible|available|supported|applicable|'
-        r'suitable|different|types?|kinds?|of)\s+)*(?:charts?|graphs?|plots?|visualizations?)\b', text)
-    return 'all' if all_types else 'dashboard'
-
-
-def table_intent(message):
-    text = words(message)
-    if re.search(r'\b(?:no|without|do not|don t) (?:a |any |use )?tables?\b',text):
-        return False
-    return bool(re.search(r'\b(?:tables?|tabular|rows and columns|side by side)\b',text))
-
-
-def _record_request(message):
-    """Explicit record scope takes priority over an 'explain' or 'how' prefix."""
-    text = words(message)
-    raw = unicodedata.normalize('NFKC',str(message))
-    enumeration = (r'\b(?:all|every|list|show|find|get|give|reveal|display|enumerate|which)\b.*'
-                   r'\b(?:(?:coupon|promo|promotion) codes?|coupons|promotions)\b')
-    explicit_codes = re.search(r'\b(?:all|every|list|show|find|get|give|reveal|display|enumerate|which)\b.*\b(?:coupon|promo|promotion|discount) codes?\b',text)
-    if explicit_codes or re.search(enumeration,text) and not re.search(r'\b(?:policy|policies|definitions?|meanings?|types)\b',text):
-        return True
-    if re.search(r'\b(?:order|invoice|customer|item|sku)(?:\s+(?:id|number))?\s+[\w]*[-_][\w-]+\b',raw,re.I):
-        return True
-    if re.search(r"\b\w+['’]s\b.*\b(?:orders?|invoices?|refunds?|accounts?)\b",raw,re.I):
-        return True
-    generic = {'mode','role','account','record','verification','profile','registration','privacy','details',
-               'status','total','types','process','number','id','date','history','request','approval',
-               'can','could','will','would','should','must','does','is','are','and','or','versus',
-               'permissions','roles','responsibilities','access','cancellation','amount','amounts',
-               'line','lines','document','documents','service','support','password','passwords','contact','email'}
-    for match in re.finditer(r'\b(?:customer|order|invoice)(?:\s+(?:id|number))?\s+(\w+)\b',raw,re.I):
-        if match[1].casefold() not in generic:
-            return True
-    if re.search(r'\b(?:return window|refund policy|return policy|coupon policy|approval threshold|cashier limit|cashier refund limit|refund limit)\b',text) and _conceptual(text):
-        return False
-    if re.search(r'\b(?:how to|how do i|how can i|show me how)\b',text):
-        return False
-    lookup = re.search(r'\b(?:show|list|display|find|search|fetch|check|get|compare|recommend|suggest|explain|describe|what|which|how much|how many|when|where|status|availability)\b|^(?:is|are|does|do)\b',text)
-    if lookup and _domains(text) and re.search(r'\b(?:my|our|current|today|yesterday|pending|recorded|overdue|available|in stock)\b',text):
-        return True
-    if (lookup and re.search(r'\d',text) and _domains(text) and
-            not re.search(r'\b(?:examples?|hypothetical|assume|illustrate|definitions?)\b',text)):
-        return True
-    if _abstract_comparison(text):
-        return False
-    if re.search(r'\b(?:coupons?|promotions?|(?:coupon|promo|promotion|discount) codes?)\b',text) and not re.search(
-            r'\b(?:policy|policies|definitions?|meanings?|means?|types|how .* work|what is a)\b',text):
-        return True
-    records = re.search(r'\b(?:orders?|invoices?|refund requests?|customers?)\b',text)
-    if records and re.search(r'\bfor\s+(?!(?:a|an|the|beginners|businesses|customers|staff|example)\b)\w+',text):
-        return True
-    definition = re.search(r'\b(?:differences?|definitions?|meanings?|permissions|roles|modes|process|steps|how to|how do|how can)\b',text)
-    return bool(records and not definition and re.search(r'\b(?:show|list|find|which|have|overdue|by|all|every|compare|versus)\b',text))
-
-
-def general_explanation(message):
-    """A model-written table is explanatory text, never evidence of store records."""
-    text = words(message)
-    if _record_request(message) or re.search(r'\b(?:and|then) (?:please )?(?:approve|reject|apply|redeem|update|delete|remove|ship|deliver|buy|purchase|checkout|cancel)\b',text):
-        return False
-    if _conceptual(text):
-        return True
-    if re.search(r'\b(?:approve|reject|apply|redeem|register|update|delete|remove|add|ship|deliver|buy|purchase|checkout|cancel|coupon codes?|promo codes?|promotion codes?)\b',text):
-        return False
-    return not _domains(text)
-
-
-def _chart_report(message, analytics_context, as_table=False):
-    """Resolve broad visuals and explicit references to the last verified report."""
-    text = words(message)
-    presentation = 'none' if as_table else chart_intent(message)
-    broad = re.search(r'\b(?:analytics|dashboard|performance overview|business overview|store overview|(?:store|shop|business) (?:wide )?(?:metrics|statistics|summary))\b', text)
-    reference = re.search(r'\b(?:it|that|those|them|these|same|above|previous|earlier|results)\b|'
-                          r'\bthis(?:$| (?:in|as|into|on|report|data|analysis|analytics|results?)\b)', text)
-    prior = analytics_context if isinstance(analytics_context, dict) else {}
-    repeat = re.search(r'\b(?:same|repeat|redo)\b', text)
-    if not presentation and reference and repeat and prior.get('kind') == 'store_overview':
-        presentation = prior.get('chart_mode', 'overview')
-    inherited = prior.get('kind') == 'store_overview' and presentation and (
-        reference or not broad and (len(text.split()) <= 6 or
-            re.search(r'\b(?:current|available|matching) data\b', text)))
-    if not broad and presentation != 'all' and not inherited:
-        return None
-    # Explicit metrics, chart types or narrower dimensions need the flexible SQL
-    # path. A named type must not be silently replaced by a whole dashboard.
-    focused = re.search(r'\b(?:only|just|top|trend|compare|comparison|anomalies|by)\b', text)
-    if _named_chart_style(text) or focused and not re.search(r'\b(?:comprehensive|everything|complete dashboard)\b', text):
-        return None
-    filter_message = re.sub(r'\b((?:all|every|each)\s+(?:the\s+)?)\d+\s+(charts?|graphs?|plots?)\b',
-                            r'\1\2', str(message), flags=re.I)
-    filter_message = re.sub(r'\b(?:for|of|on|with)\s+(?:(?:those|these|that|this|the|same|previous|current)\s+)?'
-                            r'(?:results?|data|report|analytics)\b', ' ', filter_message, flags=re.I)
-    filters, unresolved = _report_filters(filter_message)
-    if unresolved:
-        return None
-    selected = dict(filters)
-    if inherited and not re.search(r'\b(?:whole|entire|full) (?:store|shop|business)\b|\bstore wide\b', text):
-        saved = prior.get('filters', {})
-        if not isinstance(saved, dict):
-            return None
-        merged = {key: saved.get(key) for key in FILTER_KEYS}
-        if 'customer_id' in selected and selected['customer_id'] != merged['customer_id']:
-            merged['order_id'] = None
-        merged.update(selected)
-        if (merged.get('date_from') or '') > (merged.get('date_to') or '9999-12-31'):
-            return None
-        filters = tuple((key, value) for key, value in merged.items() if value is not None)
-    return ResponseContract('store_overview', bool(filters), frozenset({'finance'}),
-                            filters, presentation or 'overview')
-
-
-def request_contract(message, mode, customer_id=None, analytics_context=None, previous_message=None):
-    text = words(message)
-    text = re.sub(r'^(?:(?:please|can you|could you|would you)\s+)+', '', text)
-    reference = bool(re.search(r'\b(?:it|that|this|those|them|these|same|above|previous|earlier|results)\b',text))
-    records = _record_request(message)
-    if table_intent(message) and not chart_intent(message) and (not _conceptual(text) or reference or records):
-        if mode == 'admin':
-            report = _chart_report(message,analytics_context,as_table=True)
-            if report is not None:
-                return report
-        if reference and previous_message and not _domains(text):
-            prior = request_contract(previous_message,mode,customer_id)
-            if prior.needs_evidence:
-                return prior if prior.report else ResponseContract('data',domains=prior.domains)
-    if _conceptual(text) and not records:
-        return ResponseContract()
-    if (not records and re.match(r'^(?:remember\b|my\b|i (?:need|want|prefer)\b)',text)
-            and re.search(r'\b(?:budget|preferences?|preferred features|needs?|quantity)\b',text)
-            and not re.search(r'\b(?:show|list|find|search|check|get|compare|recommend|suggest)\b',text)):
-        return ResponseContract()
-    if re.match(r'^(?:request|submit)\b(?!\s+(?:status|history|details)\b).*\b(?:refund|return|quote|order|cart|draft)\b',text):
-        return ResponseContract()
-    if (re.fullmatch(r'(?:(?:my|the|an?) )?(?:invoice|proforma)(?: please)?',text)
-            or re.match(r'^(?:send|provide|get|prepare|generate)\b.*\b(?:invoice|proforma)\b',text)):
-        return ResponseContract()
-    if re.search(r'\b(?:place|buy|purchase|cancel|approve|reject|apply|redeem|register|'
-                 r'update|change|delete|remove|add|ship|deliver|create|quote|checkout)\b|'
-                 r'\b(?:refund|return|exchange) (?:me|my|this|that|order|the item)\b|\b(?:download|pdf)\b', text):
-        return ResponseContract()
-    if mode != 'admin' and re.search(r'\b(?:analytics|coupons?|promo codes?|promotion codes?)\b', text):
-        return ResponseContract()
-    if not customer_id and mode == 'customer' and re.search(r'\bmy (?:orders?|invoices?|refunds?|account|credit|draft|spending|billing|purchases?)\b', text):
-        return ResponseContract()
-    if mode == 'admin':
-        report = _chart_report(message, analytics_context)
-        if report is not None:
-            return report
-    broad_analytics = (re.search(r'\b(?:analytics|dashboard|performance overview|business overview|store overview|(?:store|shop|business) (?:wide )?(?:metrics|statistics|summary))\b', text)
-        or re.search(r'\bhow (?:is|s) (?:our|the|my) (?:store|shop|business) (?:doing|performing)\b', text))
-    if mode == 'admin' and broad_analytics:
-        focused = re.search(r'\b(?:only|just|top|by|trend|chart|compare|comparison|anomalies)\b', text)
-        if not _named_chart_style(text) and (not focused or re.search(r'\b(?:comprehensive|everything|complete dashboard)\b', text)):
-            filters, unresolved = _report_filters(message)
-            if not unresolved:
-                return ResponseContract('store_overview', bool(filters), frozenset({'finance'}), filters)
-            return ResponseContract('data', domains=_domains(text) | {'finance'})
-    if mode == 'admin' and (chart_intent(message) or _named_chart_style(text)) and isinstance(analytics_context, dict):
-        return ResponseContract('data')
-    product = re.search(r'\b(?:products?|items?|categories|category|range)\b', text)
-    broad = (re.search(r'\b(?:what|which) (?:all |are (?:all |the )?)?(?:products?|items?|categories)\b', text)
-             or re.search(r'\b(?:show|list|display|give|tell)\b.*\b(?:products?|items?|categories|product range)\b', text))
-    focused = re.search(r'\b(?:under|below|above|over|between|cheaper|best|recommend|compare|'
-                        r'comparison|alternatives?|prices?|features?|specifications?|sku|item code|'
-                        r'first|next|page|per page|limit|brand|named|called|in stock|chart|plot)\b|\d', text)
-    remainder = re.sub(r'\b(?:please|can|could|would|you|u|me|us|show|list|display|give|tell|'
-        r'what|which|all|are|the|do|does|have|has|sell|selling|stock|store|shop|in|at|your|our|'
-        r'products?|items?|categories|category|and|number|no|of|counts?|available|availability|range|there|'
-        r'now|currently|to|a|table|tabular|form|as|by|with|each|per|their|how|many|overview|summary)\b', '', text).strip(' ?')
-    if product and broad and not focused and not remainder:
-        # An explicit full item list uses normal detail pagination. A category
-        # summary remains the default for availability/range questions.
-        if re.search(r'\blist (?:all |the )?(?:products|items)\b', text) and not re.search(r'\b(?:categor(?:y|ies)|counts?|number|overview)\b', text):
-            return ResponseContract('data', domains=frozenset({'products'}))
-        return ResponseContract('inventory_overview', domains=frozenset({'products'}))
-    domains = _domains(text)
-    if records:
-        return ResponseContract('data',domains=domains)
-    direct = re.search(r'\b(?:show|list|display|find|search|fetch|check|get|compare|recommend|suggest)\b', text)
-    discovery = re.search(r'\b(?:do|does) (?:you|u|the store) (?:have|sell|stock)\b', text)
-    retrieval = direct or discovery or re.search(r'\b(?:how many|how much|what|which|is|are|when|where|status|available|availability)\b', text)
-    if retrieval and (domains or direct or discovery):
-        return ResponseContract('data', domains=domains)
+def request_contract(*args, **kwargs):
+    """Compatibility only: user wording no longer chooses execution or scope."""
     return ResponseContract()
+
+
+def chart_intent(*args, **kwargs):
+    """Compatibility only; chart metadata is selected in structured tool calls."""
+    return None
+
+
+def table_intent(*args, **kwargs):
+    """Compatibility only; presentation is no longer inferred by matching words."""
+    return False
+
+
+def general_explanation(*args, **kwargs):
+    """Compatibility only; the model interprets the conversation's meaning."""
+    return True
+
+
+def result_contract(name, arguments, data):
+    """Recognize complete report shapes from the exact read that actually ran.
+
+    This can be used to format trustworthy report summaries locally. It grants
+    no authority to dispatch tools, expand scope, force chart modes, or replace
+    a model's interpretation of the user's current request.
+    """
+    if not isinstance(arguments, dict) or not isinstance(data, dict) or data.get('ok') is not True:
+        return ResponseContract()
+    if name == 'execute_sql_query' and inventory_rows(arguments, data) is not None:
+        return ResponseContract('inventory_overview', domains=frozenset({'products'}))
+    if name != 'billing_analysis' or data.get('report') != 'store_overview':
+        return ResponseContract()
+    if arguments.get('report') != 'store_overview':
+        return ResponseContract()
+    coverage = data.get('coverage')
+    filters = data.get('filters')
+    mode = data.get('chart_mode')
+    summary = data.get('summary')
+    if (not isinstance(coverage, dict) or coverage.get('complete') is not True
+            or not isinstance(filters, dict) or set(filters) != set(FILTER_KEYS)
+            or mode not in ('overview', 'dashboard', 'all', 'none')
+            or mode != arguments.get('chart_mode', 'overview')
+            or not isinstance(summary, dict)):
+        return ResponseContract()
+    for key in ('matched_orders','invoice_count','draft_count','cancelled_count'):
+        if type(summary.get(key)) is not int or summary[key] < 0:
+            return ResponseContract()
+    for key, value in filters.items():
+        if value != arguments.get(key):
+            return ResponseContract()
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return ResponseContract()
+        if key.startswith('date_'):
+            try:
+                if date.fromisoformat(value).isoformat() != value:
+                    return ResponseContract()
+            except ValueError:
+                return ResponseContract()
+        elif not re.fullmatch(r'[A-Za-z0-9_-]{1,50}', value):
+            return ResponseContract()
+    if (filters['date_from'] or '') > (filters['date_to'] or '9999-12-31'):
+        return ResponseContract()
+    values = tuple((key, filters[key]) for key in FILTER_KEYS if filters[key] is not None)
+    return ResponseContract('store_overview', bool(values), frozenset({'finance'}), values, mode)
 
 
 def sql_text(query):
