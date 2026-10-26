@@ -30,6 +30,7 @@ Explain missing evidence; never infer captured-but-not-invoiced or duplicate ban
 Fulfilled quantity records inventory operations, not parcel arrival/acceptance. Only admin billing_audit
 access is allowed; estimated current-baseprice merchandise margin is not historical cost/net profit.
 Use brief plain English preserving exact names, IDs, amounts, currency and units; write percent.
+Keep product SKU/item_code internal; use product names in visible replies and numbered choices.
 No visible JSON, SQL, code, Markdown headings/emphasis/bullets, emoji or decorative symbols. Numbered
 product choices are allowed. Tables/charts/full datasets/PDFs are separate verified UI attachments;
 explain findings without duplicating their rows. Never invent links or claim an absent attachment.
@@ -52,11 +53,15 @@ DATA = """SQL/pricing/coverage: use SELECT/WITH or allowed PRAGMA table_info on 
 there are no views. Use the current table map, qualify ALL joined columns, LEFT JOIN optional metadata,
 bind user values with ?/parameters, and avoid reserved aliases such as group/order. Never guess columns.
 Preserve requested account/date/product/currency/budget/stock filters; add none to narrow a broad request.
-Whole-store product overviews need every category/product count including out-of-stock/missing metadata,
-not five examples. Native tables show complete counts. Product counts differ from inventory units.
+Broad product browsing defaults to ALL categories with COUNT(DISTINCT i.item_code) AS product_count,
+using items LEFT JOIN product_details, including out-of-stock and Uncategorised products. Do not
+return the first 200 product rows or LIMIT the category groups. Individual products follow a chosen
+category/search or an explicit item-by-item listing. Product counts differ from inventory units.
 Full product lists use stable pages <=10 with COUNT(*) OVER() AS matching_products before LIMIT;
 state X-Y of N. For an empty page query the same matching COUNT. Continue identical filters/order on
 next page; changed filters restart at zero. A LIMIT/truncated=false does not establish completeness.
+Retain canonical item_code with product name in internal detail queries/memory for order follow-ups;
+the table renderer hides SKU/item-code columns. Never repeat those identifiers in visible prose.
 Evaluate cheapest/best/rankings across the full matching scope; label selections/top-N honestly.
 Search product names/categories with product_matches(i.name, ?) / product_matches(d.category, ?)
 for case, separators and plurals. Keep IDs/financial fields exact. Check categories/features before
