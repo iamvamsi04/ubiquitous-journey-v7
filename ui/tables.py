@@ -7,8 +7,12 @@ from context.tables import sanitize_tables
 def render_tables(tables):
     for table in sanitize_tables(tables):
         import pandas as pd
+        columns = [column for column in table['columns']
+                   if column.casefold().replace('_', '').replace('-', '').replace(' ', '') not in {'sku', 'itemcode'}]
+        if not columns:
+            continue
         st.text(table['title'])
-        st.dataframe(pd.DataFrame(table['rows'], columns=table['columns']),
+        st.dataframe(pd.DataFrame(table['rows'], columns=columns),
                      hide_index=True, use_container_width=True)
         if table.get('coverage'):
             st.caption(table['coverage'])
