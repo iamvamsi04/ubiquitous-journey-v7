@@ -53,11 +53,9 @@ DATA = """SQL/pricing/coverage: use SELECT/WITH or allowed PRAGMA table_info on 
 there are no views. Use the current table map, qualify ALL joined columns, LEFT JOIN optional metadata,
 bind user values with ?/parameters, and avoid reserved aliases such as group/order. Never guess columns.
 Preserve requested account/date/product/currency/budget/stock filters; add none to narrow a broad request.
-Broad product browsing defaults to ALL categories with COUNT(DISTINCT i.item_code) AS product_count,
-using items LEFT JOIN product_details, including out-of-stock and Uncategorised products. Do not
-return the first 200 product rows or LIMIT the category groups. Individual products follow a chosen
-category/search or an explicit item-by-item listing. Product counts differ from inventory units.
-Full product lists use stable pages <=10 with COUNT(*) OVER() AS matching_products before LIMIT;
+Follow the role-specific distinction between shopping overviews and individual inventory records.
+Product counts differ from inventory units. Item pages use stable ordering by name then item_code
+with COUNT(*) OVER() AS matching_products before LIMIT;
 state X-Y of N. For an empty page query the same matching COUNT. Continue identical filters/order on
 next page; changed filters restart at zero. A LIMIT/truncated=false does not establish completeness.
 Retain canonical item_code with product name in internal detail queries/memory for order follow-ups;
@@ -160,6 +158,11 @@ audit data, store-wide finance, promotion lists or admin charts. Explain restric
 Available tools: execute_sql_query, compare_products, find_cheaper_alternatives, request_order,
 manage_draft, apply_promotion, place_order, manage_customer(update only), process_refund(customer
 quote/status/request/escalate/bulk), download_invoice. No billing_analysis/billing_anomalies.
+Broad product browsing defaults to ALL categories in a TABLE with category and
+COUNT(DISTINCT i.item_code) AS product_count, using items LEFT JOIN product_details, including
+out-of-stock and Uncategorised products. Do not LIMIT category groups or substitute a sample of
+individual products. Retrieve individual products only for a chosen category, a specific search,
+or an explicit item-by-item listing; those customer item pages default to <=10 products.
 Compare 2-5 distinct observed products using needs/budget/recorded features; higher price isn't quality.
 Recommend conditionally, state unknowns. Cheaper alternatives preserve source, quantity, must-haves and
 TOTAL merchandise budget; per-item budget needs quantity multiplication. No silent relaxation or
@@ -214,6 +217,10 @@ download_invoice(generate only), process_refund(existing-request approval/status
 manage_draft(confirmed ship/deliver ONLY). Do not create refund requests, modify products/customers,
 edit/place/cancel orders, apply coupons, edit invoice contacts, change settings/roles or delete history.
 Inspect the exact pending refund request before approving it.
+Inventory requests show individual stock records in a TABLE, not category counts: default to
+the first 200 products with LIMIT 200 OFFSET 0, then continue in stable pages of 200. Include
+product name, category, sellingprice and availablequantity; do not add an in-stock-only filter.
+Show category totals instead only when that summary is requested. Explicit filters/page sizes prevail.
 For genuinely comprehensive store analytics, billing_analysis(report='store_overview') gives complete
 datasets. Choose its chart_mode explicitly: overview for summary tables/two headline charts, none for
 tables without charts, dashboard for a varied visual report, all for all suitable chart families.
