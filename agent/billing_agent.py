@@ -14,7 +14,7 @@ from decimal import Decimal
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
-from autogen_core.model_context import UnboundedChatCompletionContext
+from autogen_core.model_context import UnboundedChatCompaletionContext
 from autogen_core.models import UserMessage, AssistantMessage, CreateResult, RequestUsage, FunctionExecutionResult
 from autogen_core.tools import ToolResult, TextResultContent
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
@@ -25,7 +25,7 @@ from mcp_server.access import ADMIN_TOOLS, CASHIER_TOOLS, CUSTOMER_TOOLS, SCOPE_
 from context.reply_text import plain_reply, split_reply_tables, reply_envelope
 from context.shopping_state import ShoppingTracker, Proposal, order_snapshot
 from database.connection import connect
-from agent.runtime_policy import runtime_policy
+from agent.prompts.runtime_policy import runtime_policy
 from agent.coupon_policy import customer_coupon_codes, may_apply_coupon
 from agent.action_policy import action_error, customer_action, canonical_action_arguments
 from agent.response_contract import ResponseContract, READ_TOOLS, result_contract, evidence_satisfied, inventory_rows
